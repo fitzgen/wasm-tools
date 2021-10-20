@@ -29,7 +29,6 @@ fuzz_target!(|bytes: &[u8]| {
         config.max_memories = 1;
         seed = u.arbitrary()?;
         // Add only the default features for now
-        config.max_memories = 1;
         Ok(())
     }) {
         Ok(m) => m,
