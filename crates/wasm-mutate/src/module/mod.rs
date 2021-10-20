@@ -12,6 +12,13 @@ pub enum PrimitiveTypeInfo {
     F32,
     F64,
     Empty,
+    // Not used so far, still is needed to correctly encode the mutated Wasm
+    V128,
+    FuncRef,
+    ExternRef,
+    ExnRef,
+    Func,
+    EmptyBlockType,
 }
 #[derive(Debug, Clone)]
 pub struct FuncInfo {
@@ -22,8 +29,8 @@ pub struct FuncInfo {
 #[derive(Debug, Clone)]
 pub enum TypeInfo {
     Func(FuncInfo),
-    Instance(),
-    Module(),
+    Instance(/* Empty for now */),
+    Module(/* Empty for now */),
 }
 
 impl TryFrom<Type> for PrimitiveTypeInfo {
@@ -36,7 +43,11 @@ impl TryFrom<Type> for PrimitiveTypeInfo {
             wasmparser::Type::F32 => Ok(PrimitiveTypeInfo::F32),
             wasmparser::Type::F64 => Ok(PrimitiveTypeInfo::F64),
             Type::EmptyBlockType => Ok(PrimitiveTypeInfo::Empty),
-            _ => Err(super::Error::UnsupportedType(EitherType::Type(value))),
+            Type::V128 => Ok(PrimitiveTypeInfo::V128),
+            Type::FuncRef => Ok(PrimitiveTypeInfo::FuncRef),
+            Type::ExternRef => Ok(PrimitiveTypeInfo::ExternRef),
+            Type::ExnRef => Ok(PrimitiveTypeInfo::ExnRef),
+            Type::Func => Ok(PrimitiveTypeInfo::Func)
         }
     }
 }
@@ -58,10 +69,8 @@ impl TryFrom<TypeDef<'_>> for TypeInfo {
                     .map(|&t| PrimitiveTypeInfo::try_from(t).unwrap())
                     .collect(),
             })),
-            _ => Err(super::Error::UnsupportedType(EitherType::TypeDef(format!(
-                "{:?}",
-                value
-            )))),
+            TypeDef::Instance(itpe) => Ok(TypeInfo::Instance()),
+            TypeDef::Module(mtpe) => Ok(TypeInfo::Module()),
         }
     }
 }

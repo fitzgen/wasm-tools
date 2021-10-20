@@ -1,6 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
+use wasm_smith::SwarmConfig;
 use std::sync::atomic::{AtomicU64, Ordering};
 use wasmparser::WasmFeatures;
 
@@ -11,8 +12,17 @@ fuzz_target!(|bytes: &[u8]| {
     let _ = env_logger::try_init();
 
     let mut seed = 0;
-    let (wasm, _config) = match wasm_tools_fuzz::generate_valid_module(bytes, |_config, u| {
+    let (wasm, _config) = match wasm_tools_fuzz::generate_valid_module(bytes, |config: &mut SwarmConfig, u| {
         seed = u.arbitrary()?;
+        // Add only the default features for now
+        config.simd_enabled = false;
+        config.module_linking_enabled = false;
+        config.memory64_enabled = false;
+        config.relaxed_simd_enabled = false;
+        config.exceptions_enabled = false;
+        config.reference_types_enabled = false; // ?
+        config.max_memories = 1;
+
         Ok(())
     }) {
         Ok(m) => m,
