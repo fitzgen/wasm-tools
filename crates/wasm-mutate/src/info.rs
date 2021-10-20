@@ -69,7 +69,7 @@ impl<'a> ModuleInfo<'a> {
                     info.section(SectionId::Code.into(), range, input_wasm);
                     parser.skip_section();
                     // update slice
-                    wasm = &wasm[range.end - range.start + consumed - 1..];
+                    wasm = &input_wasm[range.end..];
 
                     continue;
                 }
@@ -184,6 +184,9 @@ impl<'a> ModuleInfo<'a> {
                 }
                 Payload::DataCountSection { count: _, range } => {
                     info.section(SectionId::DataCount.into(), range, input_wasm);
+                }
+                Payload::TagSection(reader) => {
+                    info.section(SectionId::Tag.into(), reader.range(), input_wasm);
                 }
                 Payload::Version { .. } => {}
                 Payload::End => {

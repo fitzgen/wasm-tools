@@ -19,6 +19,7 @@ fuzz_target!(|bytes: &[u8]| {
     // use with `wasm-mutate`.
 
     let mut seed = 0;
+
     let (wasm, _config) = match wasm_tools_fuzz::generate_valid_module(bytes, |config, u| {
         config.module_linking_enabled = false;
         config.exceptions_enabled = false;
@@ -27,6 +28,7 @@ fuzz_target!(|bytes: &[u8]| {
         config.memory64_enabled = false;
         config.max_memories = 1;
         seed = u.arbitrary()?;
+        // Add only the default features for now
         Ok(())
     }) {
         Ok(m) => m,
