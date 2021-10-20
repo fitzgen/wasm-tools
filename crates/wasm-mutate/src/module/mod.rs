@@ -17,8 +17,7 @@ pub enum PrimitiveTypeInfo {
     FuncRef,
     ExternRef,
     ExnRef,
-    Func,
-    EmptyBlockType,
+    Func
 }
 #[derive(Debug, Clone)]
 pub struct FuncInfo {
