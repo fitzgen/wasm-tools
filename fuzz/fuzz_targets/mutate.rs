@@ -9,6 +9,7 @@ use wasmparser::WasmFeatures;
 static NUM_RUNS: AtomicU64 = AtomicU64::new(0);
 static NUM_SUCCESSFUL_MUTATIONS: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(feature = "wasmtime")]
 #[path = "../../crates/fuzz-stats/src/dummy.rs"]
 pub mod dummy;
 
