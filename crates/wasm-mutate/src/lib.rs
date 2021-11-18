@@ -22,7 +22,11 @@ use crate::mutators::{
 use info::ModuleInfo;
 use mutators::Mutator;
 use rand::{rngs::SmallRng, Rng, SeedableRng};
-use std::{cell::Cell, sync::Arc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+    sync::Arc,
+};
 
 #[cfg(feature = "structopt")]
 use structopt::StructOpt;
@@ -165,9 +169,14 @@ impl WasmMutate {
     }
 
     /// Run this configured `WasmMutate` on the given input Wasm.
-    pub fn run<'a>(&self, input_wasm: &'a [u8]) -> Result<Vec<u8>> {
+    pub fn run<'a>(
+        &'a self,
+        input_wasm: &'a [u8],
+    ) -> Result<Box<dyn Iterator<Item = Vec<u8>> + 'a>> {
         let mut rng = SmallRng::seed_from_u64(self.seed);
         let info = ModuleInfo::new(input_wasm)?;
+
+        let refself = RefCell::new(self);
 
         let mutators: Vec<Box<dyn Mutator>> = vec![
             Box::new(RenameExportMutator { max_name_size: 100 }),
@@ -177,20 +186,42 @@ impl WasmMutate {
             Box::new(PeepholeMutator),
             Box::new(CodemotionMutator),
         ];
-        let mut mutators: Vec<_> = mutators
-            .into_iter()
-            .filter(|m| m.can_mutate(self, &info))
-            .collect();
+        //.collect();
 
-        while !mutators.is_empty() {
+        /*  while !mutators.is_empty() {
             let i = rng.gen_range(0, mutators.len());
             let mutator = mutators.swap_remove(i);
             if let Ok(module) = mutator.mutate(self, &mut rng, &info) {
                 return Ok(module.finish());
             }
-        }
+        } */
+        // TODO Shuffle
+        let info1 = info.clone();
+        let info2 = info.clone();
+        let self1 = self.clone();
+        let self2 = self.clone();
+        let t: Box<dyn Iterator<Item = Vec<u8>>> = Box::new(
+            mutators
+                .into_iter()
+                .filter(move |m| {
+                    println!("Filtering mutator {}", m.name());
+                    m.can_mutate(&self1, &info1)
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(move |m| {
+                    println!("Lazy calling {}", m.name());
+                    m.mutate(&self2, &mut rng, &info2)
+                })
+                .filter(|mutated| mutated.is_ok())
+                .map(|t| t.unwrap())
+                .flat_map(|it| it)
+                .filter(|m| m.is_ok())
+                .map(|m| m.unwrap())
+                .map(|m| m.finish()),
+        );
 
-        Err(Error::NoMutationsApplicable)
+        Ok(t)
     }
 }
 
