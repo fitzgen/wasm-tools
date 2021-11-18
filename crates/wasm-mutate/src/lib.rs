@@ -175,6 +175,7 @@ impl WasmMutate {
     ) -> Result<Box<dyn Iterator<Item = Vec<u8>> + 'a>> {
         let mut rng = SmallRng::seed_from_u64(self.seed);
         let info = ModuleInfo::new(input_wasm)?;
+        let info = RefCell::new(info);
 
         let refself = RefCell::new(self);
 
@@ -196,22 +197,20 @@ impl WasmMutate {
             }
         } */
         // TODO Shuffle
-        let info1 = info.clone();
-        let info2 = info.clone();
-        let self1 = self.clone();
-        let self2 = self.clone();
+
         let t: Box<dyn Iterator<Item = Vec<u8>>> = Box::new(
             mutators
                 .into_iter()
-                .filter(move |m| {
+                .zip(std::iter::repeat((info, refself)))
+                .filter(move |(m, (info, refself))| {
                     println!("Filtering mutator {}", m.name());
-                    m.can_mutate(&self1, &info1)
+                    let info = info.borrow();
+                    m.can_mutate(&refself.borrow(), &info)
                 })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(move |m| {
+                .map(move |(m, (info, refself))| {
                     println!("Lazy calling {}", m.name());
-                    m.mutate(&self2, &mut rng, &info2)
+                    let info = &info.borrow();
+                    m.mutate(&refself.borrow(), &mut rng, &info)
                 })
                 .filter(|mutated| mutated.is_ok())
                 .map(|t| t.unwrap())

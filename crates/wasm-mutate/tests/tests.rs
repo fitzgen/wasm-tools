@@ -36,7 +36,7 @@ fn integration_test() {
 
     while let Some(mutated) = it.next() {
         // Down here is the validation for the correct mutation
-        log::debug!("Mutated");
+        println!("Mutated !!");
         let mut validator = Validator::new();
         validate(&mut validator, &mutated);
     }
