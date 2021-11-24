@@ -36,7 +36,6 @@ pub mod rules;
 
 /// This mutator applies a random peephole transformation to the input Wasm module
 pub struct PeepholeMutator {
-    fuel: Cell<u32>,
     max_tree_depth: u32,
 }
 type EG = egg::EGraph<Lang, PeepholeMutationAnalysis>;
@@ -46,9 +45,8 @@ type MutationContext = (Function, u32);
 
 impl PeepholeMutator {
     /// Initializes a new PeepholeMutator with fuel
-    pub fn new(fuel: u32, max_depth: u32) -> Self {
+    pub fn new(max_depth: u32) -> Self {
         PeepholeMutator {
-            fuel: Cell::new(fuel),
             max_tree_depth: max_depth,
         }
     }
@@ -130,19 +128,6 @@ impl PeepholeMutator {
             let locals = self.get_func_locals(info, fidx + info.imported_functions_count /* the function type is shifted by the imported functions*/, &mut localsreader)?;
 
             for oidx in (opcode_to_mutate..operatorscount).chain(0..opcode_to_mutate) {
-                if let Err(e) = config.consume_fuel(1) {
-                    // If fuel is low, return collected functions
-                    match e {
-                        crate::Error::NoMutationsApplicable => {
-                            if functions.is_empty() {
-                                return Err(e);
-                            }
-
-                            return Ok(functions);
-                        }
-                        _ => return Err(e),
-                    }
-                }
                 let mut dfg = DFGBuilder::new();
                 let basicblock = dfg.get_bb_from_operator(oidx, &operators);
 
@@ -221,14 +206,23 @@ impl PeepholeMutator {
                                 );
 
                                 for _ in iterator {
+                                    if let Err(e) = config.consume_fuel(1) {
+                                        // If fuel is low, return collected mutations
+                                        match e {
+                                            crate::Error::NoMutationsApplicable => {
+                                                if functions.is_empty() {
+                                                    return Err(e);
+                                                }
+
+                                                return Ok(functions);
+                                            }
+                                            _ => return Err(e),
+                                        }
+                                    }
                                     let expr = recexpr.borrow();
                                     if expr.to_string().eq(&start.to_string()) {
                                         continue;
                                     }
-                                    if self.fuel.get() == 0 {
-                                        break;
-                                    }
-                                    self.fuel.set(self.fuel.get() - 1);
 
                                     debug!(
                                         "Applied mutation {}\nfor\n{} after",
@@ -248,7 +242,6 @@ impl PeepholeMutator {
                                         &minidfg,
                                         &egraph,
                                     )?;
-                                    println!("fidx {}", fidx);
                                     functions.push((newfunc, fidx));
                                 }
 
@@ -815,10 +808,11 @@ mod tests {
                 (memory (;0;) 0)
                 (export "\00" (memory 0)))
         "#;
-        let wasmmutate = WasmMutate::default();
+        let mut wasmmutate = WasmMutate::default();
+        wasmmutate.fuel(1);
         let original = &wat::parse_str(original).unwrap();
 
-        let mutator = PeepholeMutator::new(1, 1); // the string is empty
+        let mutator = PeepholeMutator::new(1);
 
         let info = ModuleInfo::new(original).unwrap();
         let can_mutate = mutator.can_mutate(&wasmmutate, &info);
@@ -1442,24 +1436,21 @@ mod tests {
 
         let original = r#"
             (module
-                (type (;0;) (func (param i64 i32 f32)))
-                (func (;0;) (type 0) (param i64 i32 f32)
+                (type (;0;) (func (result i32)))
+                (func (;0;) (type 0)
                     i32.const 100
-                    i32.const 200
-                    i32.store offset=600 align=1
                 )
-                (func (;2;) (type 0) (param i64 i32 f32)
-                    i32.const 100
+                (func (;2;) (type 0)
                     i32.const 200
-                    i32.store offset=600 align=1
                 )
                 (memory (;0;) 0)
                 (export "\00" (memory 0)))
         "#;
-        let wasmmutate = WasmMutate::default();
+        let mut wasmmutate = WasmMutate::default();
+        wasmmutate.fuel(10);
         let original = &wat::parse_str(original).unwrap();
 
-        let mutator = PeepholeMutator::new(100, 1); // the string is empty
+        let mutator = PeepholeMutator::new(1); // the string is empty
 
         let info = ModuleInfo::new(original).unwrap();
         let can_mutate = mutator.can_mutate(&wasmmutate, &info);
@@ -1469,12 +1460,7 @@ mod tests {
         assert_eq!(can_mutate, true);
         let mut funcs = vec![];
         for (_, id) in mutator
-            .random_mutate(
-                &wasmmutate,
-                &mut rnd,
-                &info,
-                &mutator.get_rules(&wasmmutate),
-            )
+            .random_mutate(&wasmmutate, &mut rnd, &info, rules)
             .unwrap()
         {
             funcs.push(id)
@@ -1489,10 +1475,11 @@ mod tests {
         expected: &str,
         seed: u64,
     ) {
-        let wasmmutate = WasmMutate::default();
+        let mut wasmmutate = WasmMutate::default();
+        wasmmutate.fuel(10);
         let original = &wat::parse_str(original).unwrap();
 
-        let mutator = PeepholeMutator::new(1, 1); // the string is empty
+        let mutator = PeepholeMutator::new(2); // the string is empty
 
         let info = ModuleInfo::new(original).unwrap();
         let can_mutate = mutator.can_mutate(&wasmmutate, &info);
@@ -1500,7 +1487,7 @@ mod tests {
         let mut rnd = SmallRng::seed_from_u64(seed);
 
         assert_eq!(can_mutate, true);
-
+        let mut found = false;
         for mutated in mutator
             .mutate_with_rules(&wasmmutate, &mut rnd, &info, rules)
             .unwrap()
@@ -1512,7 +1499,12 @@ mod tests {
 
             let expected_bytes = &wat::parse_str(expected).unwrap();
             let expectedtext = wasmprinter::print_bytes(expected_bytes).unwrap();
-            assert_eq!(expectedtext, text);
+            if expectedtext == text {
+                found = true;
+            }
         }
+
+        // Assert that the passed mutation was found
+        assert!(found)
     }
 }

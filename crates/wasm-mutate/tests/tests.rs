@@ -30,7 +30,8 @@ fn integration_test() {
     )
     "#;
     let original = &wat::parse_str(wat).unwrap();
-    let mutator = WasmMutate::default();
+    let mut mutator = WasmMutate::default();
+    mutator.fuel(10);
     // seed is zero, which means first mutator
     let start = std::time::Instant::now();
     let it = mutator.run(original).unwrap();
