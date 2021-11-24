@@ -477,6 +477,7 @@ impl State {
         while !self.timeout_reached.load(Relaxed) {
             let seed = rng.gen();
             wasmmutate.seed(seed);
+            wasmmutate.fuel(u64::MAX);
             wasmmutate.preserve_semantics(true);
 
             // Set a panic hook since some errors are not carried out, this looks more like a patch
@@ -514,6 +515,7 @@ impl State {
                 },
             };
 
+            println!("Iterators retrieved");
             for mutated in it {
                 let mut validator = wasmparser::Validator::new();
                 match validator.validate_all(&mutated.clone()) {
