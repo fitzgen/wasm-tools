@@ -95,18 +95,15 @@ impl PeepholeMutator {
         rnd: &mut rand::prelude::SmallRng,
         info: &crate::ModuleInfo,
         rules: &[Rewrite<Lang, PeepholeMutationAnalysis>],
-        cb: impl Fn(MutationContext),
-    ) -> Result<()> {
+    ) -> Result<Vec<MutationContext>> {
         let code_section = info.get_code_section();
         let mut sectionreader = CodeSectionReader::new(code_section.data, 0)?;
         let function_count = sectionreader.get_count();
-
-        let iterator_rnd = RefCell::new(rnd);
-        let recexprref = RefCell::new(RecExpr::<Lang>::default());
+        let mut functions: Vec<MutationContext> = vec![];
 
         // This split strategy will avoid very often mutating the first function
         // and very rarely mutating the last function
-        let function_to_mutate = iterator_rnd.borrow_mut().gen_range(0, function_count);
+        let function_to_mutate = rnd.gen_range(0, function_count);
         let all_readers = (0..function_count)
             .map(|_| sectionreader.read().unwrap())
             .collect::<Vec<FunctionBody>>();
@@ -118,7 +115,7 @@ impl PeepholeMutator {
                 .into_iter_with_offsets()
                 .collect::<wasmparser::Result<Vec<OperatorAndByteOffset>>>()?;
             let operatorscount = operators.len();
-            let opcode_to_mutate = iterator_rnd.borrow_mut().gen_range(0, operatorscount);
+            let opcode_to_mutate = rnd.gen_range(0, operatorscount);
             let locals = self.get_func_locals(info, fidx + info.imported_functions_count /* the function type is shifted by the imported functions*/, &mut localsreader)?;
 
             for oidx in (opcode_to_mutate..operatorscount).chain(0..opcode_to_mutate) {
@@ -176,31 +173,33 @@ impl PeepholeMutator {
                                 let mut egraph = runner.egraph;
                                 // In theory this will return the Id of the operator eterm
                                 let root = egraph.add_expr(&start);
-                                let depth = 2;
+                                let depth = 3;
                                 #[cfg(not(test))]
                                 {
                                     let depth = 20;
                                 }
 
                                 // Rec expr used in the egraph iterator
+                                let recexpr = RecExpr::default();
+                                let recexpr = RefCell::new(recexpr);
                                 // FIXME, to use another rand generator here
                                 // can break the consistency of the
                                 // deterministic generation. This will be
                                 // ideally fixed once the migration of all
                                 // mutator to be enumerator is completed
-                                let iterator = lazy_expand(
-                                    root,
-                                    &egraph.to_owned(),
-                                    depth,
-                                    &iterator_rnd,
-                                    &recexprref,
-                                );
+                                let mut iterator_rnd = SmallRng::seed_from_u64(rnd.gen());
+                                let iterator_rnd = RefCell::new(&mut iterator_rnd);
+                                let iterator =
+                                    lazy_expand(root, &egraph, depth, &iterator_rnd, &recexpr);
                                 let mut it = 0;
                                 for _ in iterator {
+                                    if it == 1000 {
+                                        break;
+                                    }
                                     //config.consume_fuel(1)?;
                                     // Let the parser do its job
                                     it += 1;
-                                    let expr = recexprref.borrow();
+                                    let expr = recexpr.borrow();
                                     if expr.to_string().eq(&start.to_string()) {
                                         continue;
                                     }
@@ -229,7 +228,7 @@ impl PeepholeMutator {
                                         NUM_SUCCESSFUL_MUTATIONS
                                             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                                     }
-                                    cb((newfunc, fidx));
+                                    functions.push((newfunc, fidx));
                                 }
                             }
                         }
@@ -241,7 +240,11 @@ impl PeepholeMutator {
             }
         }
 
-        Ok(())
+        if functions.is_empty() {
+            Err(crate::Error::NoMutationsApplicable)
+        } else {
+            Ok(functions)
+        }
     }
 
     /// To separate the methods will allow us to test rule by rule
@@ -252,9 +255,7 @@ impl PeepholeMutator {
         info: &crate::ModuleInfo,
         rules: &[Rewrite<Lang, PeepholeMutationAnalysis>],
     ) -> Result<Vec<Result<Module>>> {
-        let mut functions: Vec<MutationContext> = vec![];
-
-        self.random_mutate(config, rnd, info, rules, |f| functions.push(f))?;
+        let functions = self.random_mutate(config, rnd, info, rules)?;
 
         if functions.is_empty() {
             return Err(crate::Error::NoMutationsApplicable);
@@ -283,8 +284,6 @@ impl PeepholeMutator {
             let module = info.replace_section(info.code.unwrap(), &codes);
             modules.push(Ok(module))
         }
-
-        debug!("Generated {} modules", modules.len());
         Ok(modules)
     }
 }
@@ -308,7 +307,6 @@ impl Mutator for PeepholeMutator {
     }
 
     fn can_mutate<'a>(&self, _: &'a crate::WasmMutate, info: &crate::ModuleInfo) -> bool {
-        println!("info {:?} {}", info.has_code(), self.name());
         info.has_code() && info.function_count > 0
     }
 }

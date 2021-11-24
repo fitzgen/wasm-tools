@@ -210,16 +210,7 @@ impl WasmMutate {
                 .map(move |(m, (info, refself))| {
                     println!("Lazy calling {}", m.name());
                     let info = &info.borrow();
-                    let t = m.mutate(&refself.borrow(), &mut rng, &info);
-                    match &t {
-                        Err(e) => {
-                            println!("ERROR {:?}", e)
-                        }
-                        Ok(_) => {
-                            println!("Done")
-                        }
-                    };
-                    t
+                    m.mutate(&refself.borrow(), &mut rng, &info)
                 })
                 .filter(|mutated| {
                     println!("{:?}", mutated.is_ok());
