@@ -269,53 +269,6 @@ impl PeepholeMutator {
         let module = info.replace_section(info.code.unwrap(), &codes);
         Ok(module)
     }
-
-    /// Checks if a variable returns and specific type
-    fn is_type(
-        &self,
-        vari: &'static str,
-        t: PrimitiveTypeInfo,
-    ) -> impl Fn(&mut EG, Id, &Subst) -> bool {
-        move |egraph: &mut EG, _, subst| {
-            let var = vari.parse();
-            match var {
-                Ok(var) => {
-                    let eclass = &egraph[subst[var]];
-                    match &eclass.data {
-                        Some(d) => d.tpe == t,
-                        None => false,
-                    }
-                }
-                Err(_) => false,
-            }
-        }
-    }
-
-    /// Condition to apply the unfold operator
-    /// check that the var is a constant
-    fn is_const(&self, vari: &'static str) -> impl Fn(&mut EG, Id, &Subst) -> bool {
-        move |egraph: &mut EG, _, subst| {
-            let var = vari.parse();
-            match var {
-                Ok(var) => {
-                    let eclass = &egraph[subst[var]];
-                    if eclass.nodes.len() == 1 {
-                        let node = &eclass.nodes[0];
-                        match node {
-                            Lang::I32(_) => true,
-                            Lang::I64(_) => true,
-                            Lang::F32(_) => true,
-                            Lang::F64(_) => true,
-                            _ => false,
-                        }
-                    } else {
-                        false
-                    }
-                }
-                Err(_) => false,
-            }
-        }
-    }
 }
 
 /// Meta mutator for peephole
