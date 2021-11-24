@@ -495,11 +495,14 @@ impl State {
                 process::exit(1);
             }));
 
+            let wasmcp = wasm.clone();
             // First stage, generate and return the mutated
-            let mutated = match wasmmutate.run(&wasm) {
-                Ok(mutated) => mutated,
+            let it = match wasmmutate.run(&wasmcp) {
+                Ok(it) => it,
                 Err(e) => match e {
-                    wasm_mutate::Error::NoMutationsApplicable => wasm.clone(),
+                    wasm_mutate::Error::NoMutationsApplicable => {
+                        Box::new(std::iter::once(wasm.clone()))
+                    }
                     _ => {
                         // Stop writing worker
                         finish_writing_wrap.store(true, SeqCst);
@@ -511,23 +514,25 @@ impl State {
                 },
             };
 
-            let mut validator = wasmparser::Validator::new();
-            match validator.validate_all(&mutated.clone()) {
-                Ok(_) => {
-                    // send the bytes for storage and compilation to another worker
-                    to_write.lock().unwrap().push(mutated.clone());
-                    wasm = mutated;
-                }
-                Err(_) => {
-                    // Stop writing worker
-                    finish_writing_wrap.store(true, SeqCst);
-                    let h1 = self.hash(&wasm);
-                    let h2 = self.hash(&mutated);
-                    self.save_crash(&wasm, Some(&mutated), seed, artifact_folder)?;
-                    anyhow::bail!(format!(
-                        "All generated Wasm should be valid {} -> {}, seed {}",
-                        h1, h2, seed
-                    ));
+            for mutated in it {
+                let mut validator = wasmparser::Validator::new();
+                match validator.validate_all(&mutated.clone()) {
+                    Ok(_) => {
+                        // send the bytes for storage and compilation to another worker
+                        to_write.lock().unwrap().push(mutated.clone());
+                        wasm = mutated;
+                    }
+                    Err(_) => {
+                        // Stop writing worker
+                        finish_writing_wrap.store(true, SeqCst);
+                        let h1 = self.hash(&wasm);
+                        let h2 = self.hash(&mutated);
+                        self.save_crash(&wasm, Some(&mutated), seed, artifact_folder)?;
+                        anyhow::bail!(format!(
+                            "All generated Wasm should be valid {} -> {}, seed {}",
+                            h1, h2, seed
+                        ));
+                    }
                 }
             }
         }
