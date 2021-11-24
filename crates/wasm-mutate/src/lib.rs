@@ -180,12 +180,12 @@ impl WasmMutate {
         let refself = RefCell::new(self);
 
         let mutators: Vec<Box<dyn Mutator>> = vec![
-            Box::new(RenameExportMutator { max_name_size: 100 }),
-            Box::new(RemoveExportMutator),
-            Box::new(SnipMutator),
-            Box::new(FunctionBodyUnreachable),
+            //Box::new(RenameExportMutator { max_name_size: 100 }),
+            // Box::new(RemoveExportMutator),
+            // Box::new(SnipMutator),
+            // Box::new(FunctionBodyUnreachable),
             Box::new(PeepholeMutator),
-            Box::new(CodemotionMutator),
+            // Box::new(CodemotionMutator),
         ];
         //.collect();
 
@@ -210,9 +210,21 @@ impl WasmMutate {
                 .map(move |(m, (info, refself))| {
                     println!("Lazy calling {}", m.name());
                     let info = &info.borrow();
-                    m.mutate(&refself.borrow(), &mut rng, &info)
+                    let t = m.mutate(&refself.borrow(), &mut rng, &info);
+                    match &t {
+                        Err(e) => {
+                            println!("ERROR {:?}", e)
+                        }
+                        Ok(_) => {
+                            println!("Done")
+                        }
+                    };
+                    t
                 })
-                .filter(|mutated| mutated.is_ok())
+                .filter(|mutated| {
+                    println!("{:?}", mutated.is_ok());
+                    mutated.is_ok()
+                })
                 .map(|t| t.unwrap())
                 .flat_map(|it| it)
                 .filter(|m| m.is_ok())
