@@ -51,39 +51,57 @@ fuzz_target!(|bytes: &[u8]| {
     wasm_mutate.preserve_semantics(true);
 
     let mutated_wasm_iterator = wasm_mutate.run(&wasm);
-    let mutated_wasm = match mutated_wasm_iterator {
-        Ok(mut w) => {
-            NUM_SUCCESSFUL_MUTATIONS.fetch_add(1, Ordering::Relaxed);
-            w.next().expect("The iterator should not be empty").clone()
+    let mut found = false;
+
+    match mutated_wasm_iterator {
+        Ok(mut iterator) => {
+            while let Some(mutated_wasm) = iterator.next() {
+                let features = WasmFeatures::default();
+                let mut validator = wasmparser::Validator::new();
+                validator.wasm_features(features);
+
+                match mutated_wasm {
+                    Ok(mutated_wasm) => {
+                        // Increase ony once for the same input Wasm
+                        if !found {
+                            NUM_SUCCESSFUL_MUTATIONS.fetch_add(1, Ordering::Relaxed);
+                            found = true;
+                        } else {
+                            NUM_SUCCESSFUL_MUTATIONS.fetch_add(1, Ordering::Relaxed);
+                            let old_num_runs = NUM_RUNS.fetch_add(1, Ordering::Relaxed);
+                            if old_num_runs % 4096 == 4095 && log::log_enabled!(log::Level::Info) {
+                                let successful = NUM_SUCCESSFUL_MUTATIONS.load(Ordering::Relaxed);
+                                let percent = successful as f64 / old_num_runs as f64 * 100.0;
+                                log::info!(
+                                    "{} / {} ({:.2}%) successful mutations.",
+                                    successful,
+                                    old_num_runs,
+                                    percent
+                                );
+                            }
+                        }
+                        let validation_result = validator.validate_all(&mutated_wasm);
+                        log::debug!("validation result = {:?}", validation_result);
+                        assert!(
+                            validation_result.is_ok(),
+                            "`wasm-mutate` should always produce a valid Wasm file"
+                        );
+
+                        #[cfg(feature = "wasmtime")]
+                        eval::assert_same_evaluation(&wasm, &mutated_wasm);
+                    }
+                    Err(e) => match e {
+                        wasm_mutate::Error::NoMutationsApplicable => continue,
+                        e => panic!("Unexpected mutation failure: {}", e),
+                    },
+                }
+            }
         }
         Err(e) => match e {
             wasm_mutate::Error::NoMutationsApplicable => return,
             e => panic!("Unexpected mutation failure: {}", e),
         },
-    };
-
-    if log::log_enabled!(log::Level::Debug) {
-        std::fs::write("mutated.wasm", &mutated_wasm).expect("should write `mutated.wasm` okay");
-        if let Ok(mutated_wat) = wasmprinter::print_bytes(&mutated_wasm) {
-            std::fs::write("mutated.wat", &mutated_wat).expect("should write `mutated.wat` okay");
-        }
     }
-
-    // The mutated Wasm should still be valid, since the input Wasm was valid.
-
-    let features = WasmFeatures::default();
-    let mut validator = wasmparser::Validator::new();
-    validator.wasm_features(features);
-
-    let validation_result = validator.validate_all(&mutated_wasm);
-    log::debug!("validation result = {:?}", validation_result);
-    assert!(
-        validation_result.is_ok(),
-        "`wasm-mutate` should always produce a valid Wasm file"
-    );
-
-    #[cfg(feature = "wasmtime")]
-    eval::assert_same_evaluation(&wasm, &mutated_wasm);
 });
 
 #[cfg(feature = "wasmtime")]

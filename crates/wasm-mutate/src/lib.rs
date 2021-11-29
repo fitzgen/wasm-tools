@@ -22,6 +22,7 @@ use info::ModuleInfo;
 use mutators::Mutator;
 use rand::seq::SliceRandom;
 use rand::{rngs::SmallRng, Rng, SeedableRng};
+use std::hash::Hasher;
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -172,52 +173,73 @@ impl WasmMutate {
     pub fn run<'a>(
         &'a self,
         input_wasm: &'a [u8],
-    ) -> Result<Box<dyn Iterator<Item = Vec<u8>> + 'a>> {
+    ) -> Result<Box<dyn Iterator<Item = Result<Vec<u8>>> + 'a>> {
         let mut rng = SmallRng::seed_from_u64(self.seed);
         let info = ModuleInfo::new(input_wasm)?;
         let info = RefCell::new(info);
 
-        let refself = RefCell::new(self);
-
-        let mut mutators: Vec<Box<dyn Mutator>> = vec![
+        let mutators: Vec<Box<dyn Mutator + 'a>> = vec![
             Box::new(RenameExportMutator { max_name_size: 100 }),
             Box::new(RemoveExportMutator),
             Box::new(SnipMutator),
             Box::new(FunctionBodyUnreachable),
-            Box::new(PeepholeMutator::new(20)),
+            Box::new(PeepholeMutator::new(2)),
             Box::new(CodemotionMutator),
         ];
 
-        mutators.shuffle(&mut rng);
-        let t: Box<dyn Iterator<Item = Vec<u8>>> = Box::new(
-            mutators
-                .into_iter()
-                .zip(std::iter::repeat((info, refself)))
-                .filter(move |(m, (info, refself))| {
-                    let info = info.borrow();
-                    m.can_mutate(&refself.borrow(), &info)
-                })
-                .map(move |(m, (info, refself))| {
-                    let info = &info.borrow();
-                    println!("Mutating with {}", m.name());
-                    m.mutate(&refself.borrow(), &mut rng, &info)
-                })
-                .filter(|mutated| {
-                    // log errors
-                    match mutated {
-                        Err(e) => println!("Error on mutation {:?}", e),
-                        Ok(_) => {}
-                    }
-                    mutated.is_ok()
-                })
-                .map(|t| t.unwrap())
-                .flat_map(|it| it)
-                .filter(|m| m.is_ok())
-                .map(|m| m.unwrap())
-                .map(|m| m.finish()),
-        );
+        let mut filtered = vec![];
+        for m in mutators {
+            if m.can_mutate(self, &info.borrow()) {
+                filtered.push(m)
+            }
+        }
 
-        Ok(t)
+        if filtered.len() == 0 {
+            return Err(crate::Error::NoMutationsApplicable);
+        };
+
+        //mutators.shuffle(&mut rng);
+
+        let mut current_mtator_index = 0;
+        let it = std::iter::from_fn(move || {
+            loop {
+                if current_mtator_index == filtered.len() {
+                    // All iterators were visited
+                    return None;
+                }
+
+                log::debug!("Current mutator {}", filtered[current_mtator_index].name());
+                let mutate = filtered[current_mtator_index].mutate(self, &mut rng, &info.borrow());
+
+                match mutate {
+                    Err(e) => {
+                        // If the error is different to NoAppliclableMutation,
+                        // return
+                        match e {
+                            Error::NoMutationsApplicable => {
+                                // jump to next iterator
+                                current_mtator_index += 1;
+                            }
+                            _ => return Some(Err(e)),
+                        }
+                    }
+                    Ok(it) => return Some(Ok(it)),
+                }
+            }
+        })
+        .flat_map(|it| match it {
+            Ok(m) => m,
+            // Propagate the error as a flat iterator
+            Err(e) => Box::new(std::iter::once(Err(e))),
+        })
+        .map(|m| -> Result<Vec<u8>> {
+            match m {
+                Ok(m) => Ok(m.finish()),
+                Err(e) => Err(e),
+            }
+        });
+
+        Ok(Box::new(it))
     }
 }
 

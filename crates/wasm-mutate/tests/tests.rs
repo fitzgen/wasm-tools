@@ -38,7 +38,7 @@ fn integration_test() {
     let mut count = 0;
     for mutated in it {
         // Down here is the validation for the correct mutation
-
+        let mutated = mutated.unwrap();
         let text = wasmprinter::print_bytes(&mutated).unwrap();
         println!("{}", text);
         let mut validator = Validator::new();

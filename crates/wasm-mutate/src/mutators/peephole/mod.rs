@@ -244,11 +244,13 @@ impl PeepholeMutator {
                                     )?;
                                     functions.push((newfunc, fidx));
                                 }
-
                                 if log::log_enabled!(log::Level::Info) {
                                     NUM_SUCCESSFUL_MUTATIONS
                                         .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                                 }
+                                // Return here, next functions could be treated
+                                // in another pass anyways
+                                return Ok(functions);
                             }
                         }
                     }
@@ -259,12 +261,7 @@ impl PeepholeMutator {
             }
         }
 
-        println!("func {:?}", functions);
-        if functions.is_empty() {
-            Err(crate::Error::NoMutationsApplicable)
-        } else {
-            Ok(functions)
-        }
+        Err(crate::Error::NoMutationsApplicable)
     }
 
     /// To separate the methods will allow us to test rule by rule
@@ -1337,7 +1334,7 @@ mod tests {
     #[test]
     fn test_peep_floats1() {
         let rules: &[Rewrite<super::Lang, PeepholeMutationAnalysis>] =
-            &[rewrite!("rule";  "1_f32" => "0_f32" )];
+            &[rewrite!("rule";  "1065353216_f32" => "0_f32" )];
 
         test_peephole_mutator(
             r#"
