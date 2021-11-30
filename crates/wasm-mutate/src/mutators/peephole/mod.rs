@@ -103,16 +103,14 @@ impl PeepholeMutator {
     }
 
     fn random_mutate<'a>(
-        &'a self,
-        config: &'a crate::WasmMutate,
-        rnd: &'a mut rand::prelude::SmallRng,
-        info: &'a crate::ModuleInfo,
+        self,
+        config: &'a mut WasmMutate,
         rules: Vec<Rewrite<Lang, PeepholeMutationAnalysis>>,
-    ) -> Result<Box<ItType<'a>>> {
-        let code_section = info.get_code_section();
+    ) -> Result<Box<dyn Iterator<Item = Result<Module>> + 'a>> {
+        let code_section = config.info().get_code_section();
         let mut sectionreader = CodeSectionReader::new(code_section.data, 0)?;
         let function_count = sectionreader.get_count();
-        let function_to_mutate = rnd.gen_range(0, function_count);
+        let function_to_mutate = config.rng().gen_range(0, function_count);
         let reader = (0..function_count)
             .map(|_| sectionreader.read().unwrap())
             .nth(function_to_mutate as usize)
@@ -124,11 +122,11 @@ impl PeepholeMutator {
             .into_iter_with_offsets()
             .collect::<wasmparser::Result<Vec<OperatorAndByteOffset>>>()?;
         let operatorscount = operators.len();
-        let opcode_to_mutate = rnd.gen_range(0, operatorscount);
+        let opcode_to_mutate = config.rng().gen_range(0, operatorscount);
         let locals = self.get_func_locals(
-            info,
-            function_to_mutate + info.imported_functions_count, /* the function type is shifted
-                                                                by the imported functions*/
+            &config.info(),
+            function_to_mutate + config.info().imported_functions_count, /* the function type is shifted
+                                                                         by the imported functions*/
             &mut localsreader,
         )?;
 
@@ -145,7 +143,7 @@ impl PeepholeMutator {
             }
             Some(basicblock) => basicblock,
         };
-        let minidfg = dfg.get_dfg(info, &operators, &basicblock, &locals);
+        let minidfg = dfg.get_dfg(&config.info(), &operators, &basicblock, &locals);
 
         let minidfg = match minidfg {
             None => {
@@ -174,10 +172,10 @@ impl PeepholeMutator {
         );
 
         let analysis = PeepholeMutationAnalysis::new(
-            info.global_types.clone(),
+            config.info().global_types.clone(),
             locals.clone(),
-            info.types_map.clone(),
-            info.function_map.clone(),
+            config.info().types_map.clone(),
+            config.info().function_map.clone(),
         );
         let runner = Runner::<Lang, PeepholeMutationAnalysis, ()>::new(analysis)
             .with_iter_limit(1) // only one iterations, do not wait for eq saturation, increasing only by one it affects the execution time of the mutator by a lot
@@ -187,92 +185,79 @@ impl PeepholeMutator {
         // In theory this will return the Id of the operator eterm
         let root = egraph.add_expr(&start);
 
-        let iterator = lazy_expand_aux(root, egraph.clone(), self.max_tree_depth, rnd.gen()).map(
-            move |expr| {
-                let mut newfunc = self.copy_locals(reader)?;
-                Encoder::build_function(
-                    info.clone(),
-                    rnd,
-                    opcode_to_mutate,
-                    &expr,
-                    &operators,
-                    &basicblock,
-                    &mut newfunc,
-                    &minidfg,
-                    &egraph,
-                )?;
-                Ok((newfunc, function_to_mutate))
-            },
-        );
+        let iterator = lazy_expand_aux(
+            root,
+            egraph.clone(),
+            self.max_tree_depth,
+            config.rng().gen(),
+        )
+        .map(move |expr| {
+            let mut newfunc = self.copy_locals(reader)?;
+            Encoder::build_function(
+                config,
+                opcode_to_mutate,
+                &expr,
+                &operators,
+                &basicblock,
+                &mut newfunc,
+                &minidfg,
+                &egraph,
+            )?;
+
+            let mut codes = CodeSection::new();
+            let code_section = config.info().get_code_section();
+            let mut sectionreader = CodeSectionReader::new(code_section.data, 0)?;
+
+            // this mutator is applicable to internal functions, so
+            // it starts by randomly selecting an index between
+            // the imported functions and the total count, total=imported + internal
+            for fidx in 0..config.info().function_count {
+                let reader = sectionreader.read()?;
+                if fidx == function_to_mutate {
+                    debug!("Mutating function  idx {:?}", fidx);
+                    codes.function(&newfunc);
+                } else {
+                    codes.raw(&code_section.data[reader.range().start..reader.range().end]);
+                }
+            }
+
+            let module = config
+                .info()
+                .replace_section(config.info().code.unwrap(), &codes);
+            Ok(module)
+        });
 
         return Ok(Box::new(iterator));
     }
 
     /// To separate the methods will allow us to test rule by rule
     fn mutate_with_rules<'a>(
-        &'a self,
-        config: &'a crate::WasmMutate,
-        rnd: &'a mut rand::prelude::SmallRng,
-        info: &'a crate::ModuleInfo,
+        self,
+        config: &'a mut WasmMutate,
         rules: Vec<Rewrite<Lang, PeepholeMutationAnalysis>>,
     ) -> Result<Box<dyn Iterator<Item = Result<Module>> + 'a>> {
-        let functions = match self.random_mutate(config, rnd, info, rules) {
-            Err(e) => {
-                println!("Err {:?}", e);
-                return Err(e);
-            }
-            Ok(it) => it,
-        };
-
-        let modules = functions.map(move |context| match context {
-            Ok((new_function, function_to_mutate)) => {
-                let mut codes = CodeSection::new();
-                let code_section = info.get_code_section();
-                let mut sectionreader = CodeSectionReader::new(code_section.data, 0)?;
-
-                // this mutator is applicable to internal functions, so
-                // it starts by randomly selecting an index between
-                // the imported functions and the total count, total=imported + internal
-                for fidx in 0..info.function_count {
-                    let reader = sectionreader.read()?;
-                    if fidx == function_to_mutate {
-                        debug!("Mutating function  idx {:?}", fidx);
-                        codes.function(&new_function);
-                    } else {
-                        codes.raw(&code_section.data[reader.range().start..reader.range().end]);
-                    }
-                }
-
-                let module = info.replace_section(info.code.unwrap(), &codes);
-                Ok(module)
-            }
-            Err(e) => Err(e),
-        });
-
-        return Ok(Box::new(modules));
+        self.random_mutate(config, rules)
     }
 }
 
 /// Meta mutator for peephole
 impl Mutator for PeepholeMutator {
     fn mutate<'a>(
-        &'a self,
-        config: &'a crate::WasmMutate,
-        rnd: &'a mut rand::prelude::SmallRng,
-        info: &'a crate::ModuleInfo,
+        self,
+        config: &'a mut crate::WasmMutate,
     ) -> Result<Box<dyn Iterator<Item = Result<Module>> + 'a>> {
         // Calculate here type related information for parameters, locals and returns
         // This information could be passed to the conditions to check for type correctness rewriting
         // Write the new rules in the rules.rs file
         let rules = self.get_rules(config);
 
-        let modules = self.mutate_with_rules(config, rnd, info, rules)?;
+        let modules = self.mutate_with_rules(config, rules)?;
 
         Ok(modules)
     }
 
-    fn can_mutate<'a>(&self, _: &'a crate::WasmMutate, info: &crate::ModuleInfo) -> bool {
-        info.has_code() && info.function_count > 0
+    fn can_mutate<'a>(&self, config: &'a WasmMutate) -> bool {
+        config.info().has_code() && config.info().function_count > 0
     }
 }
 
@@ -1122,7 +1107,7 @@ mod tests {
             (func (export "exported_func") (local i32 i32)
                 i32.const 100
                 local.set 1
-                
+
             )
         )
         "#,

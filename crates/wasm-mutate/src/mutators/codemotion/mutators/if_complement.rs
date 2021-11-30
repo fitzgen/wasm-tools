@@ -14,6 +14,7 @@ use crate::{
         },
         OperatorAndByteOffset,
     },
+    WasmMutate,
 };
 
 pub struct IfComplementMutator;
@@ -100,15 +101,13 @@ impl AstWriter for IfComplementWriter {
 }
 
 impl AstMutator for IfComplementMutator {
-    fn can_mutate<'a>(&self, _: &'a crate::WasmMutate, _: &crate::ModuleInfo, ast: &Ast) -> bool {
+    fn can_mutate<'a>(&self, _: &crate::WasmMutate, ast: &Ast) -> bool {
         ast.has_if()
     }
 
     fn mutate<'a>(
         &self,
-        _: &'a crate::WasmMutate,
-        _: &crate::ModuleInfo,
-        rnd: &mut rand::prelude::SmallRng,
+        config: &'a mut WasmMutate,
         ast: &Ast,
         locals: &[(u32, ValType)],
         operators: &Vec<OperatorAndByteOffset>,
@@ -118,7 +117,7 @@ impl AstMutator for IfComplementMutator {
         let mut newfunc = Function::new(locals.to_vec());
         let if_index = ast
             .get_ifs()
-            .choose(rnd)
+            .choose(config.rng())
             .expect("This mutator should check first if the AST contains at least one if");
         let writer = IfComplementWriter {
             if_to_mutate: *if_index,

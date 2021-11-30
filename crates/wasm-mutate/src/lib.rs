@@ -7,6 +7,8 @@
 //! tool. `wasm-mutate` can serve as a custom mutator for mutation-based
 //! fuzzing.
 
+#![allow(warnings)]
+
 #![cfg_attr(not(feature = "structopt"), deny(missing_docs))]
 mod error;
 pub(crate) mod info;
@@ -71,9 +73,8 @@ let mutated_wasm = WasmMutate::default()
 ```
 "###
 )]
-#[derive(Clone)]
 #[cfg_attr(feature = "structopt", derive(StructOpt))]
-pub struct WasmMutate {
+pub struct WasmMutate<'wasm> {
     /// The RNG seed used to choose which transformation to apply. Given the
     /// same input Wasm and same seed, `wasm-mutate` will always generate the
     /// same output Wasm.
@@ -96,9 +97,15 @@ pub struct WasmMutate {
     // CLI.
     #[cfg_attr(feature = "structopt", structopt(skip = None))]
     raw_mutate_func: Option<Arc<dyn Fn(&mut Vec<u8>) -> Result<()>>>,
+
+    #[cfg_attr(feature = "structopt", structopt(skip = None))]
+    rng: Option<SmallRng>,
+
+    #[cfg_attr(feature = "structopt", structopt(skip = None))]
+    info: Option<ModuleInfo<'wasm>>,
 }
 
-impl Default for WasmMutate {
+impl Default for WasmMutate<'_> {
     fn default() -> Self {
         let seed = 3;
         WasmMutate {
@@ -107,11 +114,13 @@ impl Default for WasmMutate {
             reduce: false,
             raw_mutate_func: None,
             fuel: Cell::new(u64::MAX),
+            rng: None,
+            info: None,
         }
     }
 }
 
-impl WasmMutate {
+impl<'wasm> WasmMutate<'wasm> {
     /// Set the RNG seed used to choose which transformation to apply.
     ///
     /// Given the same input Wasm and same seed, `wasm-mutate` will always
@@ -170,46 +179,45 @@ impl WasmMutate {
 
     /// Run this configured `WasmMutate` on the given input Wasm.
     pub fn run<'a>(
-        &'a self,
-        input_wasm: &'a [u8],
+        &'a mut self,
+        input_wasm: &'wasm [u8],
     ) -> Result<Box<dyn Iterator<Item = Result<Vec<u8>>> + 'a>> {
-        let mut rng = SmallRng::seed_from_u64(self.seed);
-        //let rng = Rc::new(RefCell::new(rng));
-        let info = ModuleInfo::new(input_wasm)?;
-        //let info = Rc::new(RefCell::new(info));
+        self.info = Some(ModuleInfo::new(input_wasm)?);
+        self.rng = Some(SmallRng::seed_from_u64(self.seed));
 
-        // let this = Rc::new(RefCell::new(*self));
-
-        let mutators: Vec<Box<dyn Mutator>> = vec![
+        let mut mutators = vec![
             //Box::new(RenameExportMutator { max_name_size: 100 }),
             //Box::new(RemoveExportMutator),
             //Box::new(SnipMutator),
             //Box::new(FunctionBodyUnreachable),
             Box::new(PeepholeMutator::new(2)),
             //Box::new(CodemotionMutator),
-        ];
-
-        let mut mutators: Vec<Box<dyn Mutator>> = mutators
-            .into_iter()
-            .filter(|m| m.can_mutate(self, &info))
-            .collect();
+        ]
+        .into_iter()
+        .filter(|m| m.can_mutate(&self))
+        .collect::<Vec<_>>();
 
         while !mutators.is_empty() {
-            let i = rng.gen_range(0, mutators.len());
+            let i = self.rng().gen_range(0, mutators.len());
             let mutator = mutators.swap_remove(i);
-            let iterator = mutator.mutate(self, &mut rng, &info)?.into_iter();
-
-            return Ok(Box::new(iterator.map(|m| -> Result<Vec<u8>> {
-                match m {
-                    Ok(m) => Ok(m.finish()),
-                    Err(e) => {
-                        println!("Error {:?}", e);
-                        Err(e)
-                    }
+            match mutator.mutate(self) {
+                Ok(iter) => return Ok(Box::new(iter.into_iter().map(|r| r.map(|m| m.finish())))),
+                Err(e) => {
+                    log::info!("mutator failed: {}; will try again", e);
+                    continue;
                 }
-            })));
+            }
         }
-        return Err(crate::Error::NoMutationsApplicable);
+
+        Err(crate::Error::NoMutationsApplicable)
+    }
+
+    pub(crate) fn rng(&mut self) -> &mut SmallRng {
+        self.rng.as_mut().unwrap()
+    }
+
+    pub(crate) fn info(&self) -> &ModuleInfo<'wasm> {
+        self.info.as_ref().unwrap()
     }
 }
 

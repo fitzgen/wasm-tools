@@ -2,6 +2,7 @@ use std::num::Wrapping;
 
 use crate::error::EitherType;
 use crate::info::ModuleInfo;
+use crate::WasmMutate;
 
 use crate::mutators::peephole::eggsy::encoder::TraversalEvent;
 use crate::mutators::peephole::{Lang, EG};
@@ -10,8 +11,7 @@ use rand::Rng;
 use wasm_encoder::{Function, Instruction, MemArg};
 
 pub(crate) fn expr2wasm(
-    _info: &ModuleInfo,
-    rnd: &mut rand::prelude::SmallRng,
+    config: &mut WasmMutate,
     expr: &RecExpr<Lang>,
     newfunc: &mut Function,
     _egraph: &EG,
@@ -622,10 +622,10 @@ pub(crate) fn expr2wasm(
                         newfunc.instruction(&Instruction::I64Load32_U(memarg));
                     }
                     Lang::RandI32 => {
-                        newfunc.instruction(&Instruction::I32Const(rnd.gen()));
+                        newfunc.instruction(&Instruction::I32Const(config.rng().gen()));
                     }
                     Lang::RandI64 => {
-                        newfunc.instruction(&Instruction::I64Const(rnd.gen()));
+                        newfunc.instruction(&Instruction::I64Const(config.rng().gen()));
                     }
                     Lang::Undef => { /* Do nothig */ }
                     Lang::UnfoldI32(value) => {
@@ -634,7 +634,7 @@ pub(crate) fn expr2wasm(
                             Lang::I32(value) => {
                                 // Getting type from eclass.
 
-                                let r: i32 = rnd.gen();
+                                let r: i32 = config.rng().gen();
                                 newfunc.instruction(&Instruction::I32Const(r));
                                 newfunc.instruction(&Instruction::I32Const(
                                     (Wrapping(*value as i32) - Wrapping(r)).0,
@@ -658,7 +658,7 @@ pub(crate) fn expr2wasm(
                             Lang::I64(value) => {
                                 // Getting type from eclass.
 
-                                let r: i64 = rnd.gen();
+                                let r: i64 = config.rng().gen();
                                 newfunc.instruction(&Instruction::I64Const(r));
                                 newfunc.instruction(&Instruction::I64Const(
                                     (Wrapping(*value) - Wrapping(r)).0,
