@@ -8,7 +8,6 @@
 //! fuzzing.
 
 #![cfg_attr(not(feature = "structopt"), deny(missing_docs))]
-
 mod error;
 pub(crate) mod info;
 pub(crate) mod module;
@@ -175,71 +174,42 @@ impl WasmMutate {
         input_wasm: &'a [u8],
     ) -> Result<Box<dyn Iterator<Item = Result<Vec<u8>>> + 'a>> {
         let mut rng = SmallRng::seed_from_u64(self.seed);
+        //let rng = Rc::new(RefCell::new(rng));
         let info = ModuleInfo::new(input_wasm)?;
-        let info = RefCell::new(info);
+        //let info = Rc::new(RefCell::new(info));
 
-        let mutators: Vec<Box<dyn Mutator + 'a>> = vec![
-            Box::new(RenameExportMutator { max_name_size: 100 }),
-            Box::new(RemoveExportMutator),
-            Box::new(SnipMutator),
-            Box::new(FunctionBodyUnreachable),
+        // let this = Rc::new(RefCell::new(*self));
+
+        let mutators: Vec<Box<dyn Mutator>> = vec![
+            //Box::new(RenameExportMutator { max_name_size: 100 }),
+            //Box::new(RemoveExportMutator),
+            //Box::new(SnipMutator),
+            //Box::new(FunctionBodyUnreachable),
             Box::new(PeepholeMutator::new(2)),
-            Box::new(CodemotionMutator),
+            //Box::new(CodemotionMutator),
         ];
 
-        let mut filtered = vec![];
-        for m in mutators {
-            if m.can_mutate(self, &info.borrow()) {
-                filtered.push(m)
-            }
-        }
+        let mut mutators: Vec<Box<dyn Mutator>> = mutators
+            .into_iter()
+            .filter(|m| m.can_mutate(self, &info))
+            .collect();
 
-        if filtered.len() == 0 {
-            return Err(crate::Error::NoMutationsApplicable);
-        };
+        while !mutators.is_empty() {
+            let i = rng.gen_range(0, mutators.len());
+            let mutator = mutators.swap_remove(i);
+            let iterator = mutator.mutate(self, &mut rng, &info)?.into_iter();
 
-        //mutators.shuffle(&mut rng);
-
-        let mut current_mtator_index = 0;
-        let it = std::iter::from_fn(move || {
-            loop {
-                if current_mtator_index == filtered.len() {
-                    // All iterators were visited
-                    return None;
-                }
-
-                log::debug!("Current mutator {}", filtered[current_mtator_index].name());
-                let mutate = filtered[current_mtator_index].mutate(self, &mut rng, &info.borrow());
-
-                match mutate {
+            return Ok(Box::new(iterator.map(|m| -> Result<Vec<u8>> {
+                match m {
+                    Ok(m) => Ok(m.finish()),
                     Err(e) => {
-                        // If the error is different to NoAppliclableMutation,
-                        // return
-                        match e {
-                            Error::NoMutationsApplicable => {
-                                // jump to next iterator
-                                current_mtator_index += 1;
-                            }
-                            _ => return Some(Err(e)),
-                        }
+                        println!("Error {:?}", e);
+                        Err(e)
                     }
-                    Ok(it) => return Some(Ok(it)),
                 }
-            }
-        })
-        .flat_map(|it| match it {
-            Ok(m) => m,
-            // Propagate the error as a flat iterator
-            Err(e) => Box::new(std::iter::once(Err(e))),
-        })
-        .map(|m| -> Result<Vec<u8>> {
-            match m {
-                Ok(m) => Ok(m.finish()),
-                Err(e) => Err(e),
-            }
-        });
-
-        Ok(Box::new(it))
+            })));
+        }
+        return Err(crate::Error::NoMutationsApplicable);
     }
 }
 
