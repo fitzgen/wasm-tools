@@ -6,7 +6,7 @@ use wasm_smith::Component;
 fn smoke_test_component() {
     let mut rng = SmallRng::seed_from_u64(0);
     let mut buf = vec![0; 1024];
-    for _ in 0..1024 {
+    for _ in 0..4096 {
         rng.fill_bytes(&mut buf);
         let u = Unstructured::new(&buf);
         if let Ok(component) = Component::arbitrary_take_rest(u) {
