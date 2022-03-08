@@ -72,7 +72,7 @@ fn smoke_test_swarm_config() {
 fn multi_value_disabled() {
     let mut rng = SmallRng::seed_from_u64(42);
     let mut buf = vec![0; 2048];
-    for i in 0..10 {
+    for _ in 0..10 {
         rng.fill_bytes(&mut buf);
         let mut u = Unstructured::new(&buf);
         let mut cfg = SwarmConfig::arbitrary(&mut u).unwrap();

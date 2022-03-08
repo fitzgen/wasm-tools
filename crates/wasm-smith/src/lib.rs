@@ -70,6 +70,7 @@ const PCT_INBOUNDS: f64 = 0.995; // bigger = less traps
 mod code_builder;
 mod config;
 mod encode;
+mod notrap;
 mod terminate;
 
 use crate::code_builder::CodeBuilderAllocations;
