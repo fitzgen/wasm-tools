@@ -3,15 +3,19 @@
 
 #![allow(unused_variables, dead_code)] // TODO FITZGEN
 
+mod available_instantiations;
+
 use crate::{arbitrary_loop, Config, DefaultConfig};
 use arbitrary::{Arbitrary, Result, Unstructured};
+use std::collections::BTreeMap;
 use std::convert::TryFrom;
+use std::hash::{Hash, Hasher};
 use std::{
     collections::{HashMap, HashSet},
     marker,
     rc::Rc,
 };
-use wasm_encoder::{InterfaceTypeRef, PrimitiveInterfaceType, ValType};
+use wasm_encoder::{PrimitiveInterfaceType, ValType};
 
 mod encode;
 
@@ -141,6 +145,9 @@ struct ComponentContext {
     //   section, which is guaranteed to be a component import.
     components: Vec<(usize, usize)>,
 
+    // TODO FITZGEN
+    component_types: HashMap<u32, Rc<ComponentType>>,
+
     // This component's module index space.
     //
     // An indirect list of all directly-nested (not transitive) modules
@@ -157,6 +164,9 @@ struct ComponentContext {
     //   section, which is guaranteed to be a module import.
     modules: Vec<(usize, usize)>,
 
+    // TODO FITZGEN: should `modules` just be a `Vec<Rc<ModuleType>>`?
+    module_types: HashMap<u32, Rc<ModuleType>>,
+
     // This component's instance index space.
     //
     // An indirect list of all instances imported or instantiated inside this
@@ -172,6 +182,9 @@ struct ComponentContext {
     //   section, which is guaranteed to be an instance import.
     instances: Vec<(usize, usize)>,
 
+    // TODO FITZGEN
+    instance_types: HashMap<u32, Rc<InstanceType>>,
+
     // This component's value index space.
     //
     // An indirect list of all values inside this component.
@@ -185,6 +198,11 @@ struct ComponentContext {
     // * a `Section::Import` and we are referenceing the `j`th import in that
     //   section, which is guaranteed to be a value import.
     values: Vec<(usize, usize)>,
+
+    // TODO FITZGEN
+    memories: Vec<(usize, usize)>,
+    tables: Vec<(usize, usize)>,
+    globals: Vec<(usize, usize)>,
 }
 
 impl ComponentContext {
@@ -199,9 +217,33 @@ impl ComponentContext {
             core_funcs: vec![],
             core_func_types: HashMap::default(),
             components: vec![],
+            component_types: HashMap::default(),
             modules: vec![],
+            module_types: HashMap::default(),
             instances: vec![],
+            instance_types: HashMap::default(),
             values: vec![],
+            memories: vec![],
+            tables: vec![],
+            globals: vec![],
+        }
+    }
+
+    fn counts(&self) -> EntityCounts {
+        EntityCounts {
+            globals: self.globals.len(),
+            tables: self.tables.len(),
+            memories: self.memories.len(),
+            funcs: self.funcs.len(),
+            modules: self.modules.len(),
+            components: self.components.len(),
+            instances: self.instances.len(),
+            values: self.values.len(),
+
+            // TODO: when the component model defines the ability to alias core
+            // tags, we'll need to define a `tags` vector on `ComponentContext`
+            // and get its length here.
+            tags: 0,
         }
     }
 
@@ -223,6 +265,22 @@ impl ComponentContext {
 
     fn num_values(&self) -> usize {
         self.values.len()
+    }
+
+    fn module_type(&self, x: u32) -> &Rc<ModuleType> {
+        &self.module_types[&x]
+    }
+
+    fn component_type(&self, x: u32) -> &ComponentType {
+        &self.component_types[&x]
+    }
+
+    fn core_instance_type(&self, x: u32) -> BTreeMap<&str, &crate::core::EntityType> {
+        todo!()
+    }
+
+    fn component_instance_type(&self, x: u32) -> BTreeMap<String, Rc<Type>> {
+        todo!()
     }
 }
 
@@ -258,7 +316,7 @@ struct TypesScope {
 }
 
 impl TypesScope {
-    fn push(&mut self, ty: Rc<Type>) -> u32 {
+    fn push(&mut self, ty: Rc<Type>) -> TypeIndex {
         let ty_idx = u32::try_from(self.types.len()).unwrap();
 
         let (is_def_type, kind_list) = match &*ty {
@@ -280,12 +338,16 @@ impl TypesScope {
             self.def_types.push(ty_idx);
         }
 
-        self.types.push(ty);
-        ty_idx
+        self.types.push(ty.clone());
+        TypeIndex(ty_idx, ty)
     }
 
     fn get(&self, index: u32) -> &Rc<Type> {
         &self.types[index as usize]
+    }
+
+    fn type_index(&self, index: u32) -> TypeIndex {
+        TypeIndex(index, self.types[index as usize].clone())
     }
 
     fn get_func(&self, index: u32) -> &Rc<FuncType> {
@@ -330,13 +392,17 @@ where
     }
 }
 
-#[derive(Default)]
+#[derive(Default, PartialEq, Eq)]
 struct EntityCounts {
     globals: usize,
     tables: usize,
     memories: usize,
     tags: usize,
     funcs: usize,
+    modules: usize,
+    components: usize,
+    instances: usize,
+    values: usize,
 }
 
 impl Component {
@@ -403,6 +469,7 @@ impl ComponentBuilder {
                 choices.push(Self::arbitrary_type_section);
                 choices.push(Self::arbitrary_import_section);
                 choices.push(Self::arbitrary_func_section);
+                choices.push(Self::arbitrary_instance_section);
 
                 if self.total_modules < self.config.max_modules() {
                     choices.push(Self::arbitrary_core_section);
@@ -416,7 +483,6 @@ impl ComponentBuilder {
 
                 // TODO FITZGEN
                 //
-                // choices.push(Self::arbitrary_instance_section);
                 // choices.push(Self::arbitrary_export_section);
                 // choices.push(Self::arbitrary_start_section);
                 // choices.push(Self::arbitrary_alias_section);
@@ -431,6 +497,8 @@ impl ComponentBuilder {
                         return Ok(component);
                     } else {
                         // Otherwise, add it as a nested component in the parent.
+                        let section_index = self.component().component.sections.len();
+                        self.component_mut().components.push((section_index, 0));
                         self.push_section(Section::Component(component));
                     }
                 }
@@ -453,6 +521,8 @@ impl ComponentBuilder {
             }
         }
         self.fill_minimums = false;
+
+        // TODO FITZGEN: push the component type as well
 
         self.types
             .pop()
@@ -501,7 +571,7 @@ impl ComponentBuilder {
         Ok(Step::StillBuilding)
     }
 
-    fn push_type(&mut self, ty: Rc<Type>) -> u32 {
+    fn push_type(&mut self, ty: Rc<Type>) -> TypeIndex {
         match self.ensure_section(
             |s| matches!(s, Section::Type(_)),
             || Section::Type(TypeSection { types: vec![] }),
@@ -559,7 +629,7 @@ impl ComponentBuilder {
         &mut self,
         u: &mut Unstructured,
         type_fuel: &mut u32,
-    ) -> Result<ModuleType> {
+    ) -> Result<Rc<ModuleType>> {
         let mut defs = vec![];
         let mut has_memory = false;
         let mut has_canonical_abi_realloc = false;
@@ -706,12 +776,12 @@ impl ComponentBuilder {
             Ok(true)
         })?;
 
-        Ok(ModuleType {
+        Ok(Rc::new(ModuleType {
             defs,
             has_memory,
             has_canonical_abi_realloc,
             has_canonical_abi_free,
-        })
+        }))
     }
 
     fn arbitrary_core_entity_type(
@@ -850,7 +920,7 @@ impl ComponentBuilder {
         &mut self,
         u: &mut Unstructured,
         type_fuel: &mut u32,
-    ) -> Result<ComponentType> {
+    ) -> Result<Rc<ComponentType>> {
         let mut defs = vec![];
         let mut imports = HashSet::new();
         let mut exports = HashSet::new();
@@ -871,7 +941,10 @@ impl ComponentBuilder {
                     let def_ty_idx = u.int_in_range(0..=max_def_ty_idx)?;
                     let ty = me.current_type_scope().def_types[def_ty_idx];
                     let ty = u32::try_from(ty).unwrap();
-                    defs.push(ComponentTypeDef::Import(Import { name, ty }));
+                    defs.push(ComponentTypeDef::Import(Import {
+                        name,
+                        ty: me.current_type_scope().type_index(ty),
+                    }));
                 } else {
                     // Type definitions, exports, and aliases.
                     let def = me.arbitrary_instance_type_def(u, &mut exports, type_fuel)?;
@@ -881,14 +954,14 @@ impl ComponentBuilder {
             })
         })?;
 
-        Ok(ComponentType { defs })
+        Ok(Rc::new(ComponentType { defs }))
     }
 
     fn arbitrary_instance_type(
         &mut self,
         u: &mut Unstructured,
         type_fuel: &mut u32,
-    ) -> Result<InstanceType> {
+    ) -> Result<Rc<InstanceType>> {
         let mut defs = vec![];
         let mut exports = HashSet::new();
 
@@ -904,7 +977,7 @@ impl ComponentBuilder {
             })
         })?;
 
-        Ok(InstanceType { defs })
+        Ok(Rc::new(InstanceType { defs }))
     }
 
     fn arbitrary_instance_type_def(
@@ -925,11 +998,12 @@ impl ComponentBuilder {
         // Export.
         if !self.current_type_scope().types.is_empty() {
             choices.push(|me, exports, u, _type_fuel| {
+                let ty = u.int_in_range(
+                    0..=u32::try_from(me.current_type_scope().types.len()).unwrap() - 1,
+                )?;
                 Ok(InstanceTypeDef::Export {
                     name: crate::unique_string(100, exports, u)?,
-                    ty: u.int_in_range(
-                        0..=u32::try_from(me.current_type_scope().types.len()).unwrap() - 1,
-                    )?,
+                    ty: me.current_type_scope().type_index(ty),
                 })
             });
         }
@@ -1026,9 +1100,12 @@ impl ComponentBuilder {
             0 => Ok(InterfaceTypeRef::Primitive(
                 self.arbitrary_primitive_interface_type(u)?,
             )),
-            1 => Ok(InterfaceTypeRef::Type(
-                *u.choose(&self.current_type_scope().interface_types)?,
-            )),
+            1 => {
+                let ty = *u.choose(&self.current_type_scope().interface_types)?;
+                Ok(InterfaceTypeRef::Type(
+                    self.current_type_scope().type_index(ty),
+                ))
+            }
             _ => unreachable!(),
         }
     }
@@ -1251,20 +1328,24 @@ impl ComponentBuilder {
         }
     }
 
-    fn push_import(&mut self, name: String, ty: u32) {
+    fn push_import(&mut self, name: String, ty_idx: u32) {
+        let ty = self.current_type_scope().get(ty_idx).clone();
         let nth = match self.ensure_section(
             |sec| matches!(sec, Section::Import(_)),
             || Section::Import(ImportSection { imports: vec![] }),
         ) {
             Section::Import(sec) => {
-                sec.imports.push(Import { name, ty });
+                sec.imports.push(Import {
+                    name,
+                    ty: TypeIndex(ty_idx, ty.clone()),
+                });
                 sec.imports.len() - 1
             }
             _ => unreachable!(),
         };
         let section_index = self.component().component.sections.len() - 1;
 
-        match &*self.current_type_scope().get(ty).clone() {
+        match &*ty {
             Type::Func(func_ty) => {
                 let func_index = u32::try_from(self.component().funcs.len()).unwrap();
                 self.component_mut().funcs.push((section_index, nth));
@@ -1275,17 +1356,29 @@ impl ComponentBuilder {
                 }
             }
 
-            Type::Module(_) => {
+            Type::Module(module_ty) => {
                 self.total_modules += 1;
+                let module_idx = u32::try_from(self.component().modules.len()).unwrap();
                 self.component_mut().modules.push((section_index, nth));
+                self.component_mut()
+                    .module_types
+                    .insert(module_idx, module_ty.clone());
             }
-            Type::Component(_) => {
+            Type::Component(component_ty) => {
                 self.total_components += 1;
+                let component_idx = u32::try_from(self.component().components.len()).unwrap();
                 self.component_mut().components.push((section_index, nth));
+                self.component_mut()
+                    .component_types
+                    .insert(component_idx, component_ty.clone());
             }
-            Type::Instance(_) => {
+            Type::Instance(instance_ty) => {
                 self.total_instances += 1;
+                let instance_idx = u32::try_from(self.component().instances.len()).unwrap();
                 self.component_mut().instances.push((section_index, nth));
+                self.component_mut()
+                    .instance_types
+                    .insert(instance_idx, instance_ty.clone());
             }
             Type::Value(_) => {
                 self.total_values += 1;
@@ -1298,7 +1391,7 @@ impl ComponentBuilder {
     fn interface_function_type(&self, inter_func: u32) -> &Rc<FuncType> {
         let (section_index, nth) = self.component().funcs[inter_func as usize];
         let inter_func_ty = match &self.component().component.sections[section_index] {
-            Section::Import(ImportSection { imports }) => imports[nth].ty,
+            Section::Import(ImportSection { imports }) => imports[nth].ty.0,
             Section::Func(FuncSection { funcs }) => match &funcs[nth] {
                 Func::CanonLift { func_ty, .. } => *func_ty,
                 _ => unreachable!(),
@@ -1484,7 +1577,7 @@ impl ComponentBuilder {
                         // type, and we haven't defined the configured maximum
                         // amount of types yet, then just define this type.
                         let ty = Rc::new(Type::Func(Rc::new(inter_func_ty)));
-                        c.push_type(ty)
+                        c.push_type(ty).index()
                     } else {
                         // Otherwise, give up on lifting this function.
                         return Ok(None);
@@ -1514,6 +1607,80 @@ impl ComponentBuilder {
         Ok(Step::StillBuilding)
     }
 
+    fn push_module(&mut self, module: crate::core::Module) {
+        let section_index = self.component().component.sections.len();
+        self.component_mut().modules.push((section_index, 0));
+        self.total_modules += 1;
+
+        // Synthesize a `ModuleType` for this module by walking over its imports
+        // and exports.
+        let mut defs = vec![];
+        let mut num_types = 0;
+        for import in &module.imports {
+            let import_def = ModuleTypeDef::Import(crate::core::Import {
+                module: import.module.clone(),
+                field: import.field.clone(),
+                entity_type: match &import.entity_type {
+                    // For function types, we need to remap indices into this
+                    // `ModuleType`'s types index space.
+                    crate::core::EntityType::Func(_idx, ty) => {
+                        let ty_idx = num_types;
+                        defs.push(ModuleTypeDef::TypeDef(crate::core::Type::Func(ty.clone())));
+                        num_types += 1;
+                        crate::core::EntityType::Func(ty_idx, ty.clone())
+                    }
+                    ty => ty.clone(),
+                },
+            });
+            defs.push(import_def);
+        }
+        for (name, export) in &module.exports {
+            let export_def = ModuleTypeDef::Export(
+                name.clone(),
+                match export {
+                    wasm_encoder::Export::Function(idx) => {
+                        // Again, we need to remap function type indices into this
+                        // `ModuleType`'s index space.
+                        let ty_idx = num_types;
+                        let ty = module.funcs[*idx as usize].1.clone();
+                        defs.push(ModuleTypeDef::TypeDef(crate::core::Type::Func(ty.clone())));
+                        num_types += 1;
+                        crate::core::EntityType::Func(ty_idx, ty)
+                    }
+                    wasm_encoder::Export::Table(idx) => {
+                        let ty = module.tables[*idx as usize].clone();
+                        crate::core::EntityType::Table(ty)
+                    }
+                    wasm_encoder::Export::Memory(idx) => {
+                        let ty = module.memories[*idx as usize].clone();
+                        crate::core::EntityType::Memory(ty)
+                    }
+                    wasm_encoder::Export::Global(idx) => {
+                        let ty = module.globals[*idx as usize].clone();
+                        crate::core::EntityType::Global(ty)
+                    }
+                    wasm_encoder::Export::Tag(idx) => {
+                        let ty = module.tags[*idx as usize].clone();
+                        crate::core::EntityType::Tag(ty)
+                    }
+                },
+            );
+            defs.push(export_def);
+        }
+        let module_idx = u32::try_from(self.component().modules.len()).unwrap();
+        self.component_mut().module_types.insert(
+            module_idx,
+            Rc::new(ModuleType {
+                defs,
+                has_memory: false,
+                has_canonical_abi_free: false,
+                has_canonical_abi_realloc: false,
+            }),
+        );
+
+        self.push_section(Section::Core(module));
+    }
+
     fn arbitrary_core_section(&mut self, u: &mut Unstructured) -> Result<Step> {
         let config: Rc<dyn Config> = Rc::clone(&self.config);
         let module = crate::core::Module::new_internal(
@@ -1521,8 +1688,7 @@ impl ComponentBuilder {
             u,
             crate::core::DuplicateImportsBehavior::Disallowed,
         )?;
-        self.push_section(Section::Core(module));
-        self.total_modules += 1;
+        self.push_module(module);
         Ok(Step::StillBuilding)
     }
 
@@ -1533,8 +1699,53 @@ impl ComponentBuilder {
         Ok(Step::StillBuilding)
     }
 
-    fn arbitrary_instance_section(&mut self, u: &mut Unstructured) -> Result<()> {
-        todo!()
+    fn push_instance(&mut self, instance: Instance) {
+        // TODO FITZGEN: push an instance type as well.
+
+        todo!();
+    }
+
+    fn arbitrary_instance_section(&mut self, u: &mut Unstructured) -> Result<Step> {
+        let mut choices: Vec<
+            fn(&mut Unstructured, &mut ComponentBuilder) -> Result<Option<Instance>>,
+        > = Vec::with_capacity(4);
+
+        // Instantiate a core Wasm module.
+        if !self.component().modules.is_empty() {
+            choices.push(|u, c| {
+                todo!();
+            });
+        }
+
+        // Instantiate a component.
+        if !self.component().components.is_empty() {
+            choices.push(|u, c| {
+                todo!();
+            });
+        }
+
+        // Tuple together core Wasm exports.
+        choices.push(|u, c| {
+            todo!();
+        });
+
+        // Tuple together component entities.
+        choices.push(|u, c| {
+            todo!();
+        });
+
+        let min = 0;
+        let max = self.config.max_instances() - self.component().instances.len();
+
+        arbitrary_loop(u, min, max, |u| {
+            let f = u.choose(&choices)?;
+            if let Some(instance) = f(u, self)? {
+                self.push_instance(instance);
+            }
+            Ok(true)
+        })?;
+
+        Ok(Step::StillBuilding)
     }
 
     fn arbitrary_export_section(&mut self, u: &mut Unstructured) -> Result<()> {
@@ -1576,9 +1787,11 @@ fn canonical_abi_for(inter_func_ty: &FuncType) -> Rc<crate::core::FuncType> {
         params: inter_func_ty
             .params
             .iter()
-            .flat_map(|ty| to_core_ty(ty.ty))
+            .flat_map(|ty| to_core_ty(ty.ty.clone()))
             .collect(),
-        results: to_core_ty(inter_func_ty.result).into_iter().collect(),
+        results: to_core_ty(inter_func_ty.result.clone())
+            .into_iter()
+            .collect(),
     })
 }
 
@@ -1598,13 +1811,13 @@ fn inverse_scalar_canonical_abi_for(
                 InterfaceTypeRef::Primitive(PrimitiveInterfaceType::S32),
                 InterfaceTypeRef::Primitive(PrimitiveInterfaceType::U32),
             ])
-            .copied(),
+            .cloned(),
         ValType::I64 => u
             .choose(&[
                 InterfaceTypeRef::Primitive(PrimitiveInterfaceType::S64),
                 InterfaceTypeRef::Primitive(PrimitiveInterfaceType::U64),
             ])
-            .copied(),
+            .cloned(),
         ValType::F32 => Ok(InterfaceTypeRef::Primitive(PrimitiveInterfaceType::Float32)),
         ValType::F64 => Ok(InterfaceTypeRef::Primitive(PrimitiveInterfaceType::Float64)),
         ValType::V128 | ValType::FuncRef | ValType::ExternRef => {
@@ -1689,9 +1902,9 @@ struct TypeSection {
 
 #[derive(Clone, Debug)]
 enum Type {
-    Module(ModuleType),
-    Component(ComponentType),
-    Instance(InstanceType),
+    Module(Rc<ModuleType>),
+    Component(Rc<ComponentType>),
+    Instance(Rc<InstanceType>),
     Func(Rc<FuncType>),
     Value(ValueType),
     Interface(InterfaceType),
@@ -1699,10 +1912,55 @@ enum Type {
 
 #[derive(Clone, Debug)]
 struct ModuleType {
+    /// The actual sequence of arbitrary `ModuleTypeDef`s we generated and will
+    /// encode in this exact shape (we will *not* canonicalize them or remove
+    /// unused defs).
     defs: Vec<ModuleTypeDef>,
+
+    // TODO FITZGEN
+    //
+    // /// The core function types scope built up in `defs`.
+    // types: Vec<Rc<crate::core::FuncType>>,
+    //
+    /// Does this module type have the canonical ABI's `memory` export?
     has_memory: bool,
+
+    /// Does this module type have the canonical ABI's `canonical_abi_realloc`
+    /// export?
     has_canonical_abi_realloc: bool,
+
+    /// Does this module type have the canonical ABI's `canonical_abi_free`
+    /// export?
     has_canonical_abi_free: bool,
+}
+
+impl ModuleType {
+    /// Get this module type's imports and exports canonicalized into
+    /// name-to-type maps.
+    fn imports_exports(
+        &self,
+    ) -> (
+        BTreeMap<&str, BTreeMap<&str, &crate::core::EntityType>>,
+        BTreeMap<&str, &crate::core::EntityType>,
+    ) {
+        let mut imports: BTreeMap<&str, BTreeMap<&str, _>> = BTreeMap::new();
+        let mut exports: BTreeMap<&str, _> = BTreeMap::new();
+        for def in &self.defs {
+            match def {
+                ModuleTypeDef::TypeDef(_) => {}
+                ModuleTypeDef::Import(imp) => {
+                    imports
+                        .entry(&imp.module)
+                        .or_default()
+                        .insert(&imp.field, &imp.entity_type);
+                }
+                ModuleTypeDef::Export(name, ty) => {
+                    exports.insert(name, ty);
+                }
+            }
+        }
+        (imports, exports)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1750,11 +2008,32 @@ struct ComponentType {
     defs: Vec<ComponentTypeDef>,
 }
 
+impl ComponentType {
+    /// Get this module type's imports and exports canonicalized into
+    /// name-to-type maps.
+    fn imports_exports(&self) -> (BTreeMap<&str, &Rc<Type>>, BTreeMap<&str, &Rc<Type>>) {
+        let mut imports: BTreeMap<&str, _> = BTreeMap::new();
+        let mut exports: BTreeMap<&str, _> = BTreeMap::new();
+        for def in &self.defs {
+            match def {
+                ComponentTypeDef::Type(_) | ComponentTypeDef::Alias(_) => {}
+                ComponentTypeDef::Import(imp) => {
+                    imports.insert(&imp.name, &imp.ty.1);
+                }
+                ComponentTypeDef::Export { name, ty } => {
+                    exports.insert(name, &ty.1);
+                }
+            }
+        }
+        (imports, exports)
+    }
+}
+
 #[derive(Clone, Debug)]
 enum ComponentTypeDef {
     Import(Import),
     Type(Rc<Type>),
-    Export { name: String, ty: u32 },
+    Export { name: String, ty: TypeIndex },
     Alias(Alias),
 }
 
@@ -1773,10 +2052,25 @@ struct InstanceType {
     defs: Vec<InstanceTypeDef>,
 }
 
+impl InstanceType {
+    fn exports(&self) -> BTreeMap<&str, &Rc<Type>> {
+        let mut exports = BTreeMap::new();
+        for def in &self.defs {
+            match def {
+                InstanceTypeDef::Type(_) | InstanceTypeDef::Alias(_) => {}
+                InstanceTypeDef::Export { name, ty } => {
+                    exports.insert(name.as_str(), &ty.1);
+                }
+            }
+        }
+        exports
+    }
+}
+
 #[derive(Clone, Debug)]
 enum InstanceTypeDef {
     Type(Rc<Type>),
-    Export { name: String, ty: u32 },
+    Export { name: String, ty: TypeIndex },
     Alias(Alias),
 }
 
@@ -1788,7 +2082,7 @@ struct FuncType {
 
 impl FuncType {
     fn is_scalar(&self) -> bool {
-        self.params.iter().all(|p| p.is_scalar()) && is_scalar(self.result)
+        self.params.iter().all(|p| p.is_scalar()) && is_scalar(&self.result)
     }
 }
 
@@ -1800,11 +2094,11 @@ struct OptionalNamedType {
 
 impl OptionalNamedType {
     fn is_scalar(&self) -> bool {
-        is_scalar(self.ty)
+        is_scalar(&self.ty)
     }
 }
 
-fn is_scalar(ty: InterfaceTypeRef) -> bool {
+fn is_scalar(ty: &InterfaceTypeRef) -> bool {
     match ty {
         InterfaceTypeRef::Primitive(prim) => match prim {
             PrimitiveInterfaceType::Unit
@@ -1903,7 +2197,7 @@ struct ImportSection {
 #[derive(Clone, Debug)]
 struct Import {
     name: String,
-    ty: u32,
+    ty: TypeIndex,
 }
 
 #[derive(Debug)]
@@ -1933,7 +2227,40 @@ enum CanonOpt {
 }
 
 #[derive(Debug)]
-struct InstanceSection {}
+struct InstanceSection {
+    instances: Vec<Instance>,
+}
+
+#[derive(Debug)]
+enum Instance {
+    /// An instantiation of a core Wasm module.
+    Module {
+        module: u32,
+        args: Vec<(String, u32)>,
+    },
+
+    /// An instantiation of a component.
+    Component {
+        component: u32,
+        args: Vec<(String, Entity)>,
+    },
+
+    /// A set of component exports tupled together as a component instance.
+    Exports(Vec<(String, Entity)>),
+
+    /// A set of core Wasm exports tupled together as a core Wasm instance.
+    CoreExports(Vec<(String, wasm_encoder::Export)>),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Entity {
+    Module(u32),
+    Component(u32),
+    Instance(u32),
+    Function(u32),
+    Value(u32),
+    Type(u32),
+}
 
 #[derive(Debug)]
 struct ExportSection {}
@@ -1943,3 +2270,46 @@ struct StartSection {}
 
 #[derive(Debug)]
 struct AliasSection {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum InterfaceTypeRef {
+    Primitive(PrimitiveInterfaceType),
+    Type(TypeIndex),
+}
+
+impl From<InterfaceTypeRef> for wasm_encoder::InterfaceTypeRef {
+    fn from(r: InterfaceTypeRef) -> wasm_encoder::InterfaceTypeRef {
+        match r {
+            InterfaceTypeRef::Primitive(p) => p.into(),
+            InterfaceTypeRef::Type(ty) => wasm_encoder::InterfaceTypeRef::Type(ty.index()),
+        }
+    }
+}
+
+/// An index into a types scope, but with the type as well for convenience.
+#[derive(Debug, Clone)]
+pub struct TypeIndex(u32, Rc<Type>);
+
+impl TypeIndex {
+    fn index(&self) -> u32 {
+        self.0
+    }
+
+    fn ty(&self) -> &Rc<Type> {
+        &self.1
+    }
+}
+
+impl PartialEq for TypeIndex {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for TypeIndex {}
+
+impl Hash for TypeIndex {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}

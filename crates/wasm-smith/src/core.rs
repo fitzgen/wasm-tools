@@ -57,7 +57,7 @@ pub struct Module {
     /// All of this module's imports. These don't have their own index space,
     /// but instead introduce entries to each imported entity's associated index
     /// space.
-    imports: Vec<Import>,
+    pub(crate) imports: Vec<Import>,
 
     /// Whether we should encode an imports section, even if `self.imports` is
     /// empty.
@@ -91,26 +91,27 @@ pub struct Module {
 
     /// All tags available to this module, sorted by their index. The list
     /// entry is the type of each tag.
-    tags: Vec<TagType>,
+    pub(crate) tags: Vec<TagType>,
 
     /// All functions available to this module, sorted by their index. The list
     /// entry points to the index in this module where the function type is
     /// defined (if available) and provides the type of the function.
-    funcs: Vec<(u32, Rc<FuncType>)>,
+    pub(crate) funcs: Vec<(u32, Rc<FuncType>)>,
 
     /// All tables available to this module, sorted by their index. The list
     /// entry is the type of each table.
-    tables: Vec<TableType>,
+    pub(crate) tables: Vec<TableType>,
 
     /// All globals available to this module, sorted by their index. The list
     /// entry is the type of each global.
-    globals: Vec<GlobalType>,
+    pub(crate) globals: Vec<GlobalType>,
 
     /// All memories available to this module, sorted by their index. The list
     /// entry is the type of each memory.
-    memories: Vec<MemoryType>,
+    pub(crate) memories: Vec<MemoryType>,
 
-    exports: Vec<(String, Export)>,
+    pub(crate) exports: Vec<(String, Export)>,
+
     start: Option<u32>,
     elems: Vec<ElementSegment>,
     code: Vec<Code>,
@@ -277,9 +278,9 @@ pub(crate) enum EntityType {
 #[derive(Clone, Debug)]
 pub(crate) struct TagType {
     /// Index of the function type.
-    func_type_idx: u32,
+    pub(crate) func_type_idx: u32,
     /// Type of the function.
-    func_type: Rc<FuncType>,
+    pub(crate) func_type: Rc<FuncType>,
 }
 
 #[derive(Debug)]
