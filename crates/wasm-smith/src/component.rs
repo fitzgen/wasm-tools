@@ -134,20 +134,7 @@ struct ComponentContext {
     core_funcs: Vec<u32>,
 
     // This component's component index space.
-    //
-    // An indirect list of all directly-nested (not transitive) components
-    // inside this component.
-    //
-    // Each entry is of the form `(i, j)` where `component.sections[i]` is
-    // guaranteed to be either
-    //
-    // * a `Section::Component` and we are referencing the component defined in
-    //   that section (in this case `j` must also be `0`, since a component
-    //   section can only contain a single nested component), or
-    //
-    // * a `Section::Import` and we are referenceing the `j`th import in that
-    //   section, which is guaranteed to be a component import.
-    components: Vec<(usize, usize)>,
+    components: Vec<Rc<ComponentType>>,
 
     // This component's module index space.
     //
@@ -337,19 +324,398 @@ impl Component {
 
 #[must_use]
 enum Step {
-    Finished(Component),
-    StillBuilding,
+    Finish,
+    KeepBuilding,
 }
 
 impl Step {
-    fn unwrap_still_building(self) {
+    fn unwrap_keep_building(self) {
         match self {
-            Step::Finished(_) => panic!(
+            Step::Finish => panic!(
                 "`Step::unwrap_still_building` called on a `Step` that is not `StillBuilding`"
             ),
-            Step::StillBuilding => {}
+            Step::KeepBuilding => {}
         }
     }
+}
+
+/// Deep copy a type into a new index space.
+///
+/// Note that "deep" might be a tiny bit of a misnomer here depending how you
+/// look at it, since nested component and instance types have their own types
+/// index spaces, but we will insert aliases to types already defined in a
+/// parent index space, but every type is copied into `defs` (or one of `defs`'s
+/// nested index spaces) at least once. That is, `defs` has a full definition of
+/// the type, but its nested index spaces might not have full definitions, and
+/// can still alias from anything up to but not beyond `defs` itself.
+///
+/// `defs` is the types index space the type should be deep copied into. Upon
+/// return, the last entry of `defs` will be the deep copy of `ty`.
+///
+/// `remapping` records which types are already available in `defs` and at
+/// what index.
+///
+/// The `to_{component,instance}_type_def` functions map a `Def` that is either
+/// a type def or an alias def to `ComponentTypeDef` and `AliasTypeDef`
+/// respectively.
+fn deep_copy_type<Def>(
+    ty: Rc<Type>,
+    defs: &mut Vec<Def>,
+    remapping: &mut HashMap<Rc<Type>, u32>,
+    mut to_component_type_def: impl FnMut(Def) -> ComponentTypeDef,
+    mut to_instance_type_def: impl FnMut(Def) -> InstanceTypeDef,
+) where
+    Def: From<Rc<Type>> + From<Alias>,
+{
+    // We shouldn't have any extraneous remappings.
+    debug_assert!(defs.len() >= remapping.len());
+
+    // The stack of type index spaces in scope at any moment in time during
+    // the traversal. As we encounter new instance or component types which
+    // introduce new type index spaces, we push onto this vector; as we exit
+    // them, we pop from it.
+    let mut defs_stack = vec![std::mem::replace(defs, vec![])];
+
+    // The stack of remappings. Always the same length as `defs_stack`.
+    let mut remapping_stack = vec![std::mem::replace(remapping, HashMap::new())];
+
+    // When visiting a type during a traversal, describes whether we are
+    // visiting it before (pre) or after (post) its children.
+    enum Event {
+        Pre,
+        Post,
+    }
+
+    // Our work list of types that we still need to traverse.
+    let mut stack = vec![(Event::Post, Rc::clone(&ty)), (Event::Pre, ty)];
+
+    while let Some((event, ty)) = stack.pop() {
+        match event {
+            // We haven't visited this type's children yet; just enqueue its
+            // child types for traversal.
+            Event::Pre => {
+                ty.for_each_type_ref(|ty| {
+                    if !remapping.contains_key(ty) {
+                        stack.push((Event::Post, ty.clone()));
+                        stack.push((Event::Pre, ty.clone()));
+                    }
+                });
+
+                if let Type::Component(_) | Type::Instance(_) = &*ty {
+                    defs_stack.push(vec![]);
+                    remapping_stack.push(HashMap::new());
+                }
+            }
+
+            // Copy this type into the new index space. This can be done
+            // shallowly at this point since we know the children were already
+            // remapped because this is a post-order traversal.n
+            Event::Post => {
+                // If we already remapped this type into this index space (can
+                // happen with DAGs) we don't need to do it a second time.
+                if remapping_stack.last().unwrap().contains_key(&ty) {
+                    continue;
+                }
+
+                // For any child types referenced by this type that we've
+                // already deep copied into a parent index space, rather than
+                // this index space, we need to add an alias to bring it into
+                // this index space. This is necessary for a type index space
+                // that looks like
+                //
+                // [
+                //   A,
+                //   [
+                //     tuple(A, A),
+                //   ]
+                // ]
+                //
+                // to ensure that the tuple type definition can properly
+                // reference type `A`.
+                ty.for_each_type_ref(|ty| {
+                    let depth = remapping_stack
+                        .iter()
+                        .rev()
+                        .position(|r| r.contains_key(ty))
+                        .expect("must have already copied child type b/c post-order");
+                    if depth == 0 {
+                        return;
+                    }
+
+                    let nth = remapping_stack[remapping_stack.len() - 1 - depth][ty];
+
+                    let index_in_this_space =
+                        u32::try_from(defs_stack.last().unwrap().len()).unwrap();
+
+                    defs_stack.last_mut().unwrap().push(
+                        Alias::Outer {
+                            count: u32::try_from(depth).unwrap(),
+                            i: nth,
+                            kind: OuterAliasKind::Type(Rc::clone(ty)),
+                        }
+                        .into(),
+                    );
+                    remapping_stack
+                        .last_mut()
+                        .unwrap()
+                        .insert(Rc::clone(ty), index_in_this_space);
+                });
+
+                let remap =
+                    |remapping_stack: &[HashMap<Rc<Type>, u32>], ty: &InterfaceTypeRef| match ty {
+                        InterfaceTypeRef::Primitive(_) => ty.clone(),
+                        InterfaceTypeRef::Type(ty) => InterfaceTypeRef::Type(TypeIndex {
+                            index: remapping_stack.last().unwrap()[&ty.ty],
+                            ty: ty.ty.clone(),
+                        }),
+                    };
+
+                let copied_type = Rc::new(match &*ty {
+                    Type::Module(mod_ty) => Type::Module(Rc::clone(mod_ty)),
+                    Type::Component(comp_ty) => {
+                        let mut defs: Vec<_> = defs_stack
+                            .pop()
+                            .unwrap()
+                            .into_iter()
+                            .map(&mut to_component_type_def)
+                            .collect();
+                        let mut num_types = defs.len();
+                        for def in &comp_ty.defs {
+                            match def {
+                                ComponentTypeDef::Type(_) | ComponentTypeDef::Alias(_) => {
+                                    // Already deep copied.
+                                }
+                                ComponentTypeDef::Import(imp) => {
+                                    let depth = remapping_stack
+                                        .iter()
+                                        .rev()
+                                        .position(|r| r.contains_key(&imp.ty.ty))
+                                        .expect(
+                                            "must have already copied child type b/c post-order",
+                                        );
+                                    let nth = remapping_stack[remapping_stack.len() - 1 - depth]
+                                        [&imp.ty.ty];
+
+                                    if depth > 0 {
+                                        // If the type wasn't copied into this
+                                        // component type's nested index space, then
+                                        // we need to alias it.
+                                        defs.push(ComponentTypeDef::Alias(Alias::Outer {
+                                            count: u32::try_from(depth).unwrap(),
+                                            i: nth,
+                                            kind: OuterAliasKind::Type(imp.ty.ty.clone()),
+                                        }));
+                                        num_types += 1;
+                                        defs.push(ComponentTypeDef::Import(Import {
+                                            name: imp.name.clone(),
+                                            ty: TypeIndex {
+                                                index: u32::try_from(num_types - 1).unwrap(),
+                                                ty: imp.ty.ty.clone(),
+                                            },
+                                        }));
+                                    } else {
+                                        // The type was copied into this index
+                                        // space, so we can use it directly.
+                                        defs.push(ComponentTypeDef::Import(Import {
+                                            name: imp.name.clone(),
+                                            ty: TypeIndex {
+                                                index: nth,
+                                                ty: imp.ty.ty.clone(),
+                                            },
+                                        }));
+                                    }
+                                }
+                                ComponentTypeDef::Export { name, ty } => {
+                                    let depth = remapping_stack
+                                        .iter()
+                                        .rev()
+                                        .position(|r| r.contains_key(&ty.ty))
+                                        .expect(
+                                            "must have already copied child type b/c post-order",
+                                        );
+                                    let nth =
+                                        remapping_stack[remapping_stack.len() - 1 - depth][&ty.ty];
+
+                                    if depth > 0 {
+                                        // If the type wasn't copied into this
+                                        // component type's nested index space, then
+                                        // we need to alias it.
+                                        defs.push(ComponentTypeDef::Alias(Alias::Outer {
+                                            count: u32::try_from(depth).unwrap(),
+                                            i: nth,
+                                            kind: OuterAliasKind::Type(ty.ty.clone()),
+                                        }));
+                                        num_types += 1;
+                                        defs.push(ComponentTypeDef::Export {
+                                            name: name.clone(),
+                                            ty: TypeIndex {
+                                                index: u32::try_from(num_types - 1).unwrap(),
+                                                ty: ty.ty.clone(),
+                                            },
+                                        });
+                                    } else {
+                                        // The type was copied into this index
+                                        // space, so we can use it directly.
+                                        defs.push(ComponentTypeDef::Export {
+                                            name: name.clone(),
+                                            ty: TypeIndex {
+                                                index: nth,
+                                                ty: ty.ty.clone(),
+                                            },
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        Type::Component(Rc::new(ComponentType { defs }))
+                    }
+                    Type::Instance(inst_ty) => {
+                        let mut defs: Vec<_> = defs_stack
+                            .pop()
+                            .unwrap()
+                            .into_iter()
+                            .map(&mut to_instance_type_def)
+                            .collect();
+                        let mut num_types = defs.len();
+                        for def in &inst_ty.defs {
+                            match def {
+                                InstanceTypeDef::Type(_) | InstanceTypeDef::Alias(_) => {
+                                    // Already deep copied.
+                                }
+                                InstanceTypeDef::Export { name, ty } => {
+                                    let depth = remapping_stack
+                                        .iter()
+                                        .rev()
+                                        .position(|r| r.contains_key(&ty.ty))
+                                        .expect(
+                                            "must have already copied child type b/c post-order",
+                                        );
+                                    let nth =
+                                        remapping_stack[remapping_stack.len() - 1 - depth][&ty.ty];
+
+                                    if depth > 0 {
+                                        // If the type wasn't copied into this
+                                        // instance type's nested index space,
+                                        // then we need to alias it.
+                                        defs.push(InstanceTypeDef::Alias(Alias::Outer {
+                                            count: u32::try_from(depth).unwrap(),
+                                            i: nth,
+                                            kind: OuterAliasKind::Type(ty.ty.clone()),
+                                        }));
+                                        num_types += 1;
+                                        defs.push(InstanceTypeDef::Export {
+                                            name: name.clone(),
+                                            ty: TypeIndex {
+                                                index: u32::try_from(num_types - 1).unwrap(),
+                                                ty: ty.ty.clone(),
+                                            },
+                                        });
+                                    } else {
+                                        // The type was copied into this index
+                                        // space, so we can use it directly.
+                                        defs.push(InstanceTypeDef::Export {
+                                            name: name.clone(),
+                                            ty: TypeIndex {
+                                                index: nth,
+                                                ty: ty.ty.clone(),
+                                            },
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        Type::Instance(Rc::new(InstanceType { defs }))
+                    }
+                    Type::Func(func_ty) => Type::Func(Rc::new(FuncType {
+                        params: func_ty
+                            .params
+                            .iter()
+                            .map(|p| OptionalNamedType {
+                                name: p.name.clone(),
+                                ty: remap(&remapping_stack, &p.ty),
+                            })
+                            .collect(),
+                        result: remap(&remapping_stack, &func_ty.result),
+                    })),
+                    Type::Value(val_ty) => {
+                        Type::Value(ValueType(remap(&remapping_stack, &val_ty.0)))
+                    }
+                    Type::Interface(inter_ty) => Type::Interface(match inter_ty {
+                        InterfaceType::Primitive(p) => InterfaceType::Primitive(*p),
+                        InterfaceType::Record(r) => InterfaceType::Record(RecordType {
+                            fields: r
+                                .fields
+                                .iter()
+                                .map(|ty| NamedType {
+                                    name: ty.name.clone(),
+                                    ty: remap(&remapping_stack, &ty.ty),
+                                })
+                                .collect(),
+                        }),
+                        InterfaceType::Variant(var_ty) => InterfaceType::Variant(VariantType {
+                            cases: var_ty
+                                .cases
+                                .iter()
+                                .map(|(ty, default)| {
+                                    (
+                                        NamedType {
+                                            name: ty.name.clone(),
+                                            ty: remap(&remapping_stack, &ty.ty),
+                                        },
+                                        *default,
+                                    )
+                                })
+                                .collect(),
+                        }),
+                        InterfaceType::List(list_ty) => InterfaceType::List(ListType {
+                            elem_ty: remap(&remapping_stack, &list_ty.elem_ty),
+                        }),
+                        InterfaceType::Tuple(tup_ty) => InterfaceType::Tuple(TupleType {
+                            fields: tup_ty
+                                .fields
+                                .iter()
+                                .map(|ty| remap(&remapping_stack, ty))
+                                .collect(),
+                        }),
+                        InterfaceType::Flags(flags) => InterfaceType::Flags(flags.clone()),
+                        InterfaceType::Enum(enum_ty) => InterfaceType::Enum(enum_ty.clone()),
+                        InterfaceType::Union(union_ty) => InterfaceType::Union(UnionType {
+                            variants: union_ty
+                                .variants
+                                .iter()
+                                .map(|ty| remap(&remapping_stack, ty))
+                                .collect(),
+                        }),
+                        InterfaceType::Option(opt_ty) => InterfaceType::Option(OptionType {
+                            inner_ty: remap(&remapping_stack, &opt_ty.inner_ty),
+                        }),
+                        InterfaceType::Expected(exp_ty) => InterfaceType::Expected(ExpectedType {
+                            ok_ty: remap(&remapping_stack, &exp_ty.ok_ty),
+                            err_ty: remap(&remapping_stack, &exp_ty.err_ty),
+                        }),
+                    }),
+                });
+
+                // If we popped a types index from `defs_stack`, make sure our
+                // remappings stack stays in sync.
+                remapping_stack.truncate(defs_stack.len());
+
+                // Add the copied type to this index space and record it in our
+                // remappings.
+                defs_stack.last_mut().unwrap().push(copied_type.into());
+                remapping_stack.last_mut().unwrap().insert(
+                    ty,
+                    u32::try_from(defs_stack.last().unwrap().len() - 1).unwrap(),
+                );
+            }
+        }
+    }
+
+    assert_eq!(defs_stack.len(), 1);
+    *defs = defs_stack.pop().unwrap();
+
+    assert_eq!(remapping_stack.len(), 1);
+    *remapping = remapping_stack.pop().unwrap();
 }
 
 impl ComponentBuilder {
@@ -408,18 +774,75 @@ impl ComponentBuilder {
 
             let f = u.choose(&choices)?;
             match f(self, u)? {
-                Step::StillBuilding => {}
-                Step::Finished(component) => {
-                    if self.components.is_empty() {
-                        // If we just finished the root component, then return it.
-                        return Ok(component);
-                    } else {
-                        // Otherwise, add it as a nested component in the parent.
-                        self.push_section(Section::Component(component));
-                    }
-                }
+                Step::KeepBuilding => {}
+                Step::Finish => match self.components.len() {
+                    0 => unreachable!(),
+                    // If we just finished the root component, then return it.
+                    1 => return Ok(self.components.pop().unwrap().component),
+                    // Otherwise, add it as a nested component in the parent.
+                    _ => self.push_current_component(),
+                },
             }
         }
+    }
+
+    fn current_component_type(&self) -> Rc<ComponentType> {
+        let mut type_defs = vec![];
+        let mut remapping = HashMap::new();
+        let mut defs = vec![];
+
+        for sec in &self.component().component.sections {
+            match sec {
+                Section::Import(sec) => {
+                    for imp in &sec.imports {
+                        deep_copy_type(
+                            imp.ty.ty.clone(),
+                            &mut type_defs,
+                            &mut remapping,
+                            |def| def,
+                            |def| match def {
+                                ComponentTypeDef::Type(ty) => InstanceTypeDef::Type(ty),
+                                ComponentTypeDef::Alias(a) => InstanceTypeDef::Alias(a),
+                                _ => unreachable!(),
+                            },
+                        );
+                        defs.push(ComponentTypeDef::Import(Import {
+                            name: imp.name.clone(),
+                            ty: TypeIndex {
+                                index: u32::try_from(type_defs.len() - 1).unwrap(),
+                                ty: imp.ty.ty.clone(),
+                            },
+                        }));
+                    }
+                }
+                Section::Export(_) => {
+                    unimplemented!("no support for generating the export section yet")
+                }
+                _ => continue,
+            }
+        }
+
+        Rc::new(ComponentType {
+            defs: type_defs.into_iter().chain(defs).collect(),
+        })
+    }
+
+    fn push_current_component(&mut self) {
+        debug_assert!(self.components.len() > 1);
+
+        let ty = self.current_component_type();
+
+        let _types = self
+            .types
+            .pop()
+            .expect("should have a types scope for the component we are finishing");
+        let component = self
+            .components
+            .pop()
+            .expect("should have a component that we are finishing");
+
+        self.component_mut().components.push(ty);
+        self.push_section(Section::Component(component.component));
     }
 
     fn finish_component(&mut self, u: &mut Unstructured) -> Result<Step> {
@@ -427,21 +850,18 @@ impl ComponentBuilder {
         self.fill_minimums = true;
         {
             if self.current_type_scope().types.len() < self.config.min_types() {
-                self.arbitrary_type_section(u)?.unwrap_still_building();
+                self.arbitrary_type_section(u)?.unwrap_keep_building();
             }
             if self.component().num_imports < self.config.min_imports() {
-                self.arbitrary_import_section(u)?.unwrap_still_building();
+                self.arbitrary_import_section(u)?.unwrap_keep_building();
             }
             if self.component().funcs.len() < self.config.min_funcs() {
-                self.arbitrary_func_section(u)?.unwrap_still_building();
+                self.arbitrary_func_section(u)?.unwrap_keep_building();
             }
         }
         self.fill_minimums = false;
 
-        self.types
-            .pop()
-            .expect("should have a types scope for the component we are finishing");
-        Ok(Step::Finished(self.components.pop().unwrap().component))
+        Ok(Step::Finish)
     }
 
     fn config(&self) -> &dyn Config {
@@ -482,7 +902,7 @@ impl ComponentBuilder {
 
     fn arbitrary_custom_section(&mut self, u: &mut Unstructured) -> Result<Step> {
         self.push_section(Section::Custom(u.arbitrary()?));
-        Ok(Step::StillBuilding)
+        Ok(Step::KeepBuilding)
     }
 
     fn push_type(&mut self, ty: Rc<Type>) -> u32 {
@@ -518,7 +938,7 @@ impl ComponentBuilder {
             Ok(true)
         })?;
 
-        Ok(Step::StillBuilding)
+        Ok(Step::KeepBuilding)
     }
 
     fn arbitrary_type(&mut self, u: &mut Unstructured, type_fuel: &mut u32) -> Result<Rc<Type>> {
@@ -1277,9 +1697,9 @@ impl ComponentBuilder {
                 self.total_modules += 1;
                 self.component_mut().modules.push((section_index, nth));
             }
-            Type::Component(_) => {
+            Type::Component(ty) => {
                 self.total_components += 1;
-                self.component_mut().components.push((section_index, nth));
+                self.component_mut().components.push(Rc::clone(ty));
             }
             Type::Instance(ty) => {
                 self.total_instances += 1;
@@ -1403,7 +1823,7 @@ impl ComponentBuilder {
             })?;
         }
 
-        Ok(Step::StillBuilding)
+        Ok(Step::KeepBuilding)
     }
 
     fn arbitrary_func_section(&mut self, u: &mut Unstructured) -> Result<Step> {
@@ -1509,7 +1929,7 @@ impl ComponentBuilder {
             Ok(true)
         })?;
 
-        Ok(Step::StillBuilding)
+        Ok(Step::KeepBuilding)
     }
 
     fn arbitrary_core_section(&mut self, u: &mut Unstructured) -> Result<Step> {
@@ -1521,14 +1941,14 @@ impl ComponentBuilder {
         )?;
         self.push_section(Section::Core(module));
         self.total_modules += 1;
-        Ok(Step::StillBuilding)
+        Ok(Step::KeepBuilding)
     }
 
     fn arbitrary_component_section(&mut self, u: &mut Unstructured) -> Result<Step> {
         self.types.push(TypesScope::default());
         self.components.push(ComponentContext::empty());
         self.total_components += 1;
-        Ok(Step::StillBuilding)
+        Ok(Step::KeepBuilding)
     }
 
     fn arbitrary_instance_section(&mut self, u: &mut Unstructured) -> Result<()> {
@@ -1697,6 +2117,88 @@ enum Type {
     Interface(InterfaceType),
 }
 
+impl Type {
+    fn for_each_type_ref(&self, mut f: impl FnMut(&Rc<Type>)) {
+        match self {
+            Type::Module(_) => {}
+            Type::Component(comp_ty) => {
+                for def in &comp_ty.defs {
+                    match def {
+                        ComponentTypeDef::Type(ty) => f(ty),
+                        ComponentTypeDef::Alias(alias) => {
+                            if let Alias::Outer {
+                                kind: OuterAliasKind::Type(ty),
+                                ..
+                            } = alias
+                            {
+                                f(ty);
+                            }
+                        }
+                        ComponentTypeDef::Import(_) | ComponentTypeDef::Export { .. } => {}
+                    }
+                }
+            }
+            Type::Instance(inst_ty) => {
+                for def in &inst_ty.defs {
+                    match def {
+                        InstanceTypeDef::Type(ty) => f(ty),
+                        InstanceTypeDef::Alias(alias) => {
+                            if let Alias::Outer {
+                                kind: OuterAliasKind::Type(ty),
+                                ..
+                            } = alias
+                            {
+                                f(ty);
+                            }
+                        }
+                        InstanceTypeDef::Export { .. } => {}
+                    }
+                }
+            }
+            Type::Func(func_ty) => {
+                for param in &func_ty.params {
+                    param.ty.for_each_type_ref(&mut f);
+                }
+                func_ty.result.for_each_type_ref(&mut f);
+            }
+            Type::Value(val_ty) => {
+                val_ty.0.for_each_type_ref(&mut f);
+            }
+            Type::Interface(inter_ty) => match inter_ty {
+                InterfaceType::Primitive(_) => {}
+                InterfaceType::Record(record_ty) => {
+                    for field in &record_ty.fields {
+                        field.ty.for_each_type_ref(&mut f);
+                    }
+                }
+                InterfaceType::Variant(var_ty) => {
+                    for (case, _) in &var_ty.cases {
+                        case.ty.for_each_type_ref(&mut f);
+                    }
+                }
+                InterfaceType::List(list_ty) => list_ty.elem_ty.for_each_type_ref(&mut f),
+                InterfaceType::Tuple(tup_ty) => {
+                    for field in &tup_ty.fields {
+                        field.for_each_type_ref(&mut f);
+                    }
+                }
+                InterfaceType::Flags(_) => {}
+                InterfaceType::Enum(_) => {}
+                InterfaceType::Union(union_ty) => {
+                    for ty in &union_ty.variants {
+                        ty.for_each_type_ref(&mut f);
+                    }
+                }
+                InterfaceType::Option(opt_ty) => opt_ty.inner_ty.for_each_type_ref(&mut f),
+                InterfaceType::Expected(exp_ty) => {
+                    exp_ty.ok_ty.for_each_type_ref(&mut f);
+                    exp_ty.err_ty.for_each_type_ref(&mut f);
+                }
+            },
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ModuleType {
     defs: Vec<ModuleTypeDef>,
@@ -1756,6 +2258,18 @@ enum ComponentTypeDef {
     Type(Rc<Type>),
     Export { name: String, ty: TypeIndex },
     Alias(Alias),
+}
+
+impl From<Rc<Type>> for ComponentTypeDef {
+    fn from(ty: Rc<Type>) -> Self {
+        ComponentTypeDef::Type(ty)
+    }
+}
+
+impl From<Alias> for ComponentTypeDef {
+    fn from(alias: Alias) -> Self {
+        ComponentTypeDef::Alias(alias)
+    }
 }
 
 impl From<InstanceTypeDef> for ComponentTypeDef {
@@ -1950,6 +2464,14 @@ enum InterfaceTypeRef {
     Type(TypeIndex),
 }
 
+impl InterfaceTypeRef {
+    fn for_each_type_ref(&self, mut f: impl FnMut(&Rc<Type>)) {
+        if let InterfaceTypeRef::Type(ty) = self {
+            f(&ty.ty);
+        }
+    }
+}
+
 impl From<InterfaceTypeRef> for wasm_encoder::InterfaceTypeRef {
     fn from(r: InterfaceTypeRef) -> Self {
         match r {
@@ -1959,8 +2481,20 @@ impl From<InterfaceTypeRef> for wasm_encoder::InterfaceTypeRef {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Eq)]
 struct TypeIndex {
     index: u32,
     ty: Rc<Type>,
+}
+
+impl PartialEq for TypeIndex {
+    fn eq(&self, other: &Self) -> bool {
+        self.ty == other.ty
+    }
+}
+
+impl std::hash::Hash for TypeIndex {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.ty.hash(state);
+    }
 }
